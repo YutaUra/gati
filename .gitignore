@@ -1,1 +1,10 @@
 CLAUDE.local.md
+
+# Nix
+.direnv/
+
+# Node.js
+node_modules/
+
+# Rust
+target/
