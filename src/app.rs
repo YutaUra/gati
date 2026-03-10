@@ -236,6 +236,15 @@ impl App {
         let _ = cli_clipboard::set_contents(text);
     }
 
+    /// Refresh state when the filesystem watcher detects changes.
+    /// Re-reads the file tree and recomputes diff for the currently viewed file.
+    fn refresh_on_fs_change(&mut self) {
+        let _ = self.file_tree.model.refresh_tree();
+        if let Some(path) = self.file_viewer.current_file().map(|p| p.to_path_buf()) {
+            self.load_diff_for_file(&path);
+        }
+    }
+
     fn load_diff_for_file(&mut self, path: &std::path::Path) {
         if let Some(ref workdir) = self.git_workdir {
             let line_diff = diff::compute_line_diff(workdir, path);
@@ -351,10 +360,10 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<(
             }
         }
 
-        // Refresh tree and git status when the watcher detects file-system changes
+        // Refresh tree, git status, and diff when the watcher detects file-system changes
         if let Some(ref watcher) = fs_watcher {
             if watcher.has_changed() {
-                let _ = app.file_tree.model.refresh_tree();
+                app.refresh_on_fs_change();
             }
         }
     }
@@ -1409,5 +1418,66 @@ mod tests {
         handle_mouse(&mut app, ev, 100);
 
         assert_eq!(app.focus, Focus::Tree); // unchanged
+    }
+
+    // Git diff refresh on filesystem change
+    fn setup_git_repo(files: &[(&str, &str)]) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let repo = git2::Repository::init(tmp.path()).unwrap();
+
+        for (name, content) in files {
+            let path = tmp.path().join(name);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&path, content).unwrap();
+        }
+
+        // Initial commit with all files
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = git2::Signature::now("test", "test@test.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+
+        tmp
+    }
+
+    #[test]
+    fn refresh_on_fs_change_recomputes_diff_for_current_file() {
+        let tmp = setup_git_repo(&[("file.rs", "line1\nline2\n")]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+
+        // Select the file to load it into the viewer with diff
+        let file_path = tmp.path().join("file.rs");
+        app.handle_action(Action::FileSelected(file_path.clone()));
+
+        // Initially committed, so no diff markers (all unchanged)
+        let has_changes = app.file_viewer.line_diff.as_ref().map_or(false, |d| {
+            d.lines.iter().any(|k| *k != crate::diff::DiffLineKind::Unchanged)
+        });
+        assert!(!has_changes, "all lines should be unchanged after initial commit");
+
+        // Simulate external modification (adds a new line)
+        fs::write(&file_path, "line1\nline2\nline3\n").unwrap();
+
+        // Call the refresh method (simulating what watcher triggers)
+        app.refresh_on_fs_change();
+
+        // Diff should now show the new line as Added
+        let diff = app
+            .file_viewer
+            .line_diff
+            .as_ref()
+            .expect("diff should be present after refresh");
+        assert_eq!(
+            diff.line_kind(3),
+            crate::diff::DiffLineKind::Added,
+            "new line 3 should be marked as Added after fs change refresh"
+        );
     }
 }
