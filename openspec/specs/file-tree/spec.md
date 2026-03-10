@@ -100,6 +100,14 @@ The system SHALL allow users to expand and collapse directories using l/Right ar
 - **WHEN** a root-level file or collapsed directory (depth 0) is selected and the user presses h or Left arrow
 - **THEN** nothing happens (no parent to collapse)
 
+#### Scenario: Double-tap l recursively expands all subdirectories
+- **WHEN** a directory is selected (expanded or collapsed) and the user presses l or Right arrow twice within 400ms
+- **THEN** the directory and all its descendant directories are expanded recursively
+
+#### Scenario: Double-tap h folds to root-level ancestor
+- **WHEN** the user presses h or Left arrow twice within 400ms
+- **THEN** the selection moves to the root-level (depth 0) ancestor directory and it is collapsed, hiding all descendants
+
 #### Scenario: l on a file entry
 - **WHEN** a file entry is selected and the user presses l or Right arrow
 - **THEN** nothing happens (the selection and tree remain unchanged)
@@ -149,6 +157,37 @@ The system SHALL scroll the file tree view to keep the selected entry visible wh
 #### Scenario: Selection moves above visible area
 - **WHEN** the user navigates up past the first visible row in the tree pane
 - **THEN** the tree view scrolls up to keep the selected entry visible
+
+### Requirement: File tree supports mouse interaction
+The system SHALL allow mouse-based interaction with the file tree, including clicking to select entries and scrolling the tree viewport.
+
+#### Scenario: Click on a file entry
+- **WHEN** the user clicks on a file entry in the tree pane
+- **THEN** the entry is selected and its contents are displayed in the file viewer
+
+#### Scenario: Click on a collapsed directory
+- **WHEN** the user clicks on a collapsed directory entry in the tree pane
+- **THEN** the directory is selected and expanded
+
+#### Scenario: Click on an expanded directory
+- **WHEN** the user clicks on an expanded directory entry in the tree pane
+- **THEN** the directory is collapsed
+
+#### Scenario: Click beyond tree entries
+- **WHEN** the user clicks in the tree pane below the last entry
+- **THEN** the selection does not change
+
+#### Scenario: Mouse wheel scroll down in tree pane
+- **WHEN** the mouse cursor is over the tree pane and the user scrolls the mouse wheel down
+- **THEN** the tree viewport scrolls down by 5 lines without moving the selection
+
+#### Scenario: Mouse wheel scroll up in tree pane
+- **WHEN** the mouse cursor is over the tree pane and the user scrolls the mouse wheel up
+- **THEN** the tree viewport scrolls up by 5 lines without moving the selection
+
+#### Scenario: Keyboard navigation after mouse scroll brings selection into view
+- **WHEN** the selection is off-screen due to mouse scrolling and the user presses a navigation key (j/k/arrow)
+- **THEN** the viewport adjusts to show the selection
 
 ### Requirement: File tree respects .gitignore
 The system SHALL filter entries matching .gitignore patterns. Hidden files and directories (starting with `.`) SHALL be hidden by default. The `.git` directory SHALL always be hidden.

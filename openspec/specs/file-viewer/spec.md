@@ -22,7 +22,7 @@ The system SHALL display the full contents of the selected file in the right pan
 - **THEN** the file viewer detects the language from the first line and applies syntax highlighting
 
 ### Requirement: File viewer supports scrolling
-The system SHALL allow vertical scrolling through the file contents using j/k or Up/Down arrows (line by line) and Ctrl-d/Ctrl-u (half page) when the viewer pane is focused.
+The system SHALL allow vertical scrolling through the file contents using j/k or Up/Down arrows (line by line) and Ctrl-d/Ctrl-u (half page) when the viewer pane is focused. The file viewer SHALL also support mouse wheel scrolling when the mouse cursor is over the viewer pane, scrolling by 5 lines per tick.
 
 #### Scenario: Scroll down line by line
 - **WHEN** the viewer is focused and the user presses j or Down arrow
@@ -40,13 +40,57 @@ The system SHALL allow vertical scrolling through the file contents using j/k or
 - **WHEN** the viewer is focused and the user presses Ctrl-u
 - **THEN** the view scrolls up by half the pane height
 
-#### Scenario: Scroll clamped at end of file
-- **WHEN** the view is at the end of the file and the user presses j or Ctrl-d
-- **THEN** the view does not scroll further
+#### Scenario: Vertical scroll clamped at end of file
+- **WHEN** the view is scrolled to the bottom of the file
+- **THEN** scrolling stops when the last line of the file reaches the bottom of the viewport, plus 1 line of padding
+
+#### Scenario: Mouse wheel scroll down
+- **WHEN** the mouse cursor is over the file viewer pane and the user scrolls the mouse wheel down
+- **THEN** the viewer content scrolls down by 5 lines
+
+#### Scenario: Mouse wheel scroll up
+- **WHEN** the mouse cursor is over the file viewer pane and the user scrolls the mouse wheel up
+- **THEN** the viewer content scrolls up by 5 lines
+
+#### Scenario: Mouse wheel over tree pane does not scroll viewer
+- **WHEN** the mouse cursor is over the file tree pane and the user scrolls the mouse wheel
+- **THEN** the viewer content does not scroll (the tree scrolls instead)
 
 #### Scenario: Scroll clamped at beginning of file
 - **WHEN** the view is at the beginning of the file and the user presses k or Ctrl-u
 - **THEN** the view does not scroll further
+
+### Requirement: File viewer supports horizontal scrolling
+The file viewer SHALL support horizontal scrolling to view content that extends beyond the viewport width. Horizontal scrolling SHALL be available via keyboard (H/L or Left/Right arrows) and mouse (Shift+wheel or native horizontal scroll). The line number gutter SHALL remain fixed and not be affected by horizontal scrolling. Horizontal scroll offset SHALL reset to 0 when a new file is loaded.
+
+#### Scenario: Scroll right with keyboard
+- **WHEN** the user presses L or Right arrow in the file viewer
+- **THEN** the viewport shifts right by 4 columns, revealing more content on the right side
+
+#### Scenario: Scroll left with keyboard
+- **WHEN** the user presses H or Left arrow in the file viewer
+- **THEN** the viewport shifts left by 4 columns (minimum 0)
+
+#### Scenario: Horizontal scroll resets on file change
+- **WHEN** a new file is loaded in the viewer
+- **THEN** the horizontal scroll offset resets to 0
+
+#### Scenario: Mouse horizontal scroll
+- **WHEN** the mouse cursor is over the viewer pane and the user scrolls horizontally (Shift+wheel or native horizontal scroll)
+- **THEN** the viewport shifts left or right by 4 columns per tick
+
+#### Scenario: Horizontal offset applied to rendering
+- **WHEN** the viewer has a horizontal scroll offset greater than 0
+- **THEN** each line of content is rendered starting from that character offset
+- **AND** the line number gutter remains fixed (not scrolled)
+
+#### Scenario: Horizontal scroll clamped at end of longest line
+- **WHEN** the view is scrolled horizontally to the right
+- **THEN** scrolling stops when the end of the longest line reaches the right edge of the viewport, plus 2 columns of padding
+
+#### Scenario: Horizontal scroll clamped when content fits viewport
+- **WHEN** all lines in the file are shorter than the viewport width
+- **THEN** horizontal scrolling has no effect
 
 ### Requirement: Binary files are detected and not displayed as text
 The system SHALL detect binary files by checking for null bytes in the first 512 bytes. Binary files SHALL display a placeholder message instead of their raw contents.

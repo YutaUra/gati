@@ -15,6 +15,14 @@ use crate::components::{Action, Component};
 use crate::diff::{DiffLineKind, LineDiff, UnifiedDiff, UnifiedDiffLine};
 use crate::highlight::Highlighter;
 
+/// Columns to scroll per horizontal scroll tick.
+pub const H_SCROLL_AMOUNT: usize = 4;
+
+/// Extra padding (in columns) added beyond the longest line for horizontal scroll.
+const H_SCROLL_PADDING: usize = 2;
+/// Extra padding (in lines) added beyond the last line for vertical scroll.
+const V_SCROLL_PADDING: usize = 1;
+
 /// Content to display in the file viewer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ViewerContent {
@@ -43,7 +51,14 @@ pub struct FileViewer {
     pub visible_height: usize,
     /// Cursor line position within the file (0-indexed).
     pub cursor_line: usize,
+    /// Horizontal scroll offset in characters (0 = no horizontal scroll).
+    pub h_scroll: usize,
+    /// Width available for code content in characters (set during render, excludes gutter).
+    pub visible_content_width: usize,
     highlighter: Highlighter,
+    /// Pre-computed highlighted spans for each line (populated on file load).
+    /// Avoids re-highlighting on every render, which was O(scroll_offset).
+    highlighted_lines: Vec<Vec<Span<'static>>>,
     /// Per-line diff info for gutter markers in normal mode.
     pub line_diff: Option<LineDiff>,
     /// Parsed unified diff for diff mode.
@@ -61,7 +76,10 @@ impl FileViewer {
             scroll_offset: 0,
             visible_height: 20,
             cursor_line: 0,
+            h_scroll: 0,
+            visible_content_width: 0,
             highlighter: Highlighter::new(),
+            highlighted_lines: Vec::new(),
             line_diff: None,
             unified_diff: None,
             diff_mode: false,
@@ -79,9 +97,11 @@ impl FileViewer {
     pub fn load_file(&mut self, path: &Path) {
         self.scroll_offset = 0;
         self.cursor_line = 0;
+        self.h_scroll = 0;
         self.diff_mode = false;
         self.line_diff = None;
         self.unified_diff = None;
+        self.highlighted_lines.clear();
 
         // Try to read the file
         let bytes = match std::fs::read(path) {
@@ -120,6 +140,16 @@ impl FileViewer {
         let first_line = lines.first().map(|s| s.as_str()).unwrap_or("");
         let syntax = self.highlighter.detect_syntax(path, first_line);
         let syntax_name = syntax.name.clone();
+
+        // Pre-compute highlighted spans for all lines so rendering is O(visible_lines)
+        // instead of O(scroll_offset) on every frame.
+        let mut hl_state = self.highlighter.new_highlight_state(syntax);
+        self.highlighted_lines.reserve(lines.len());
+        for line in &lines {
+            let spans = self.highlighter.highlight_line(&mut hl_state, &format!("{line}\n"));
+            self.highlighted_lines.push(spans);
+        }
+
         self.content = ViewerContent::File {
             path: path.to_path_buf(),
             lines,
@@ -143,15 +173,37 @@ impl FileViewer {
     }
 
     fn max_scroll(&self) -> usize {
-        self.total_lines().saturating_sub(1)
+        (self.total_lines() + V_SCROLL_PADDING).saturating_sub(self.visible_height)
     }
 
-    fn scroll_down(&mut self, amount: usize) {
+    fn max_line_len(&self) -> usize {
+        match &self.content {
+            ViewerContent::File { lines, .. } => {
+                lines.iter().map(|l| l.chars().count()).max().unwrap_or(0)
+            }
+            _ => 0,
+        }
+    }
+
+    pub fn scroll_down(&mut self, amount: usize) {
         self.scroll_offset = (self.scroll_offset + amount).min(self.max_scroll());
     }
 
-    fn scroll_up(&mut self, amount: usize) {
+    pub fn scroll_up(&mut self, amount: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(amount);
+    }
+
+    pub fn scroll_right(&mut self) {
+        let max_len = self.max_line_len();
+        if max_len == 0 {
+            return;
+        }
+        let max = (max_len + H_SCROLL_PADDING).saturating_sub(self.visible_content_width);
+        self.h_scroll = (self.h_scroll + H_SCROLL_AMOUNT).min(max);
+    }
+
+    pub fn scroll_left(&mut self) {
+        self.h_scroll = self.h_scroll.saturating_sub(H_SCROLL_AMOUNT);
     }
 
     pub fn render_to_buffer(&mut self, area: Rect, buf: &mut Buffer, focused: bool) {
@@ -201,24 +253,13 @@ impl FileViewer {
             }
             ViewerContent::File {
                 lines,
-                syntax_name,
                 ..
             } => {
                 let gutter_width = line_number_width(lines.len());
                 let has_diff = self.line_diff.is_some();
-
-                // Look up syntax by name and create highlight state
-                let syntax = self
-                    .highlighter
-                    .syntax_set
-                    .find_syntax_by_name(syntax_name)
-                    .unwrap_or_else(|| self.highlighter.syntax_set.find_syntax_plain_text());
-                let mut hl_state = self.highlighter.new_highlight_state(syntax);
-
-                // Advance highlight state past lines before scroll_offset
-                for line_text in lines.iter().take(self.scroll_offset) {
-                    let _ = self.highlighter.highlight_line(&mut hl_state, &format!("{line_text}\n"));
-                }
+                // gutter = diff marker (1 if present) + line number digits + 1 space
+                let gutter_cols = gutter_width + 1 + if has_diff { 1 } else { 0 };
+                self.visible_content_width = (inner.width as usize).saturating_sub(gutter_cols);
 
                 let mut render_row: u16 = 0;
                 let max_rows = inner.height;
@@ -228,7 +269,6 @@ impl FileViewer {
                         break;
                     }
 
-                    let line_text = &lines[code_line_idx];
                     let line_num = code_line_idx + 1;
 
                     let mut spans = Vec::new();
@@ -254,8 +294,17 @@ impl FileViewer {
                     let num_str = format!("{:>width$} ", line_num, width = gutter_width);
                     spans.push(Span::styled(num_str, Style::default().fg(Color::DarkGray)));
 
-                    let highlighted = self.highlighter.highlight_line(&mut hl_state, &format!("{line_text}\n"));
-                    spans.extend(highlighted);
+                    // Use pre-computed highlight cache (O(1) per line instead of O(scroll_offset))
+                    let highlighted = if code_line_idx < self.highlighted_lines.len() {
+                        self.highlighted_lines[code_line_idx].clone()
+                    } else {
+                        vec![Span::raw(lines[code_line_idx].clone())]
+                    };
+                    if self.h_scroll > 0 {
+                        spans.extend(skip_chars_in_spans(highlighted, self.h_scroll));
+                    } else {
+                        spans.extend(highlighted);
+                    }
 
                     let line = Line::from(spans);
 
@@ -425,6 +474,14 @@ impl Component for FileViewer {
                 }
                 Ok(Action::None)
             }
+            (KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Left, _) => {
+                self.scroll_left();
+                Ok(Action::None)
+            }
+            (KeyCode::Char('l'), KeyModifiers::NONE) | (KeyCode::Right, _) => {
+                self.scroll_right();
+                Ok(Action::None)
+            }
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                 let half = self.visible_height / 2;
                 self.scroll_down(half);
@@ -447,6 +504,46 @@ impl Component for FileViewer {
             _ => Ok(Action::None),
         }
     }
+}
+
+/// Drop the first `skip` characters across a sequence of spans, preserving styles.
+/// Characters that fall entirely within skipped spans are removed; a span that is
+/// partially skipped retains only the remaining suffix with its original style.
+fn skip_chars_in_spans(spans: Vec<Span<'_>>, skip: usize) -> Vec<Span<'static>> {
+    if skip == 0 {
+        return spans
+            .into_iter()
+            .map(|s| Span::styled(s.content.into_owned(), s.style))
+            .collect();
+    }
+
+    let mut remaining = skip;
+    let mut result = Vec::new();
+
+    for span in spans {
+        let char_count = span.content.chars().count();
+        if remaining >= char_count {
+            remaining -= char_count;
+            continue;
+        }
+        if remaining > 0 {
+            // Find byte offset of the `remaining`-th character to avoid
+            // slicing inside a multi-byte character (e.g. →, CJK).
+            let byte_offset = span
+                .content
+                .char_indices()
+                .nth(remaining)
+                .map(|(i, _)| i)
+                .unwrap_or(span.content.len());
+            let sliced = &span.content[byte_offset..];
+            result.push(Span::styled(sliced.to_owned(), span.style));
+            remaining = 0;
+        } else {
+            result.push(Span::styled(span.content.into_owned(), span.style));
+        }
+    }
+
+    result
 }
 
 /// Check if data is binary by looking for null bytes in the first 512 bytes.
@@ -566,6 +663,36 @@ mod tests {
         // Cursor moved to line 10, viewport should scroll to keep it visible
         assert_eq!(viewer.cursor_line, 10);
         assert!(viewer.scroll_offset > 0);
+    }
+
+    #[test]
+    fn scroll_down_stops_when_last_line_at_viewport_bottom() {
+        let content: Vec<u8> = (0..100).map(|i| format!("line {i}\n")).collect::<String>().into();
+        let (_tmp, path) = tmp_file("long.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.visible_height = 20;
+        viewer.load_file(&path);
+
+        // Scroll all the way down
+        for _ in 0..200 {
+            viewer.scroll_down(1);
+        }
+
+        // Last line (index 99) should be at the bottom of the viewport + padding,
+        // so scroll_offset = total_lines + V_SCROLL_PADDING - visible_height = 100 + 3 - 20 = 83
+        assert_eq!(viewer.scroll_offset, 100 + V_SCROLL_PADDING - 20);
+    }
+
+    #[test]
+    fn short_file_does_not_scroll() {
+        let (_tmp, path) = tmp_file("short.txt", b"line1\nline2\nline3");
+        let mut viewer = FileViewer::new();
+        viewer.visible_height = 20;
+        viewer.load_file(&path);
+
+        viewer.scroll_down(10);
+        // 3 lines < 20 visible height → no scrolling possible
+        assert_eq!(viewer.scroll_offset, 0);
     }
 
     #[test]
@@ -821,5 +948,157 @@ mod tests {
             }
             other => panic!("Expected Error content, got {:?}", other),
         }
+    }
+
+    // Horizontal scroll tests
+    #[test]
+    fn h_scroll_defaults_to_zero() {
+        let viewer = FileViewer::new();
+        assert_eq!(viewer.h_scroll, 0);
+    }
+
+    #[test]
+    fn h_scroll_resets_on_load_file() {
+        let (_tmp, path) = tmp_file("test.rs", b"line1\nline2");
+        let mut viewer = FileViewer::new();
+        viewer.h_scroll = 8;
+        viewer.load_file(&path);
+        assert_eq!(viewer.h_scroll, 0);
+    }
+
+    #[test]
+    fn scroll_right_increases_h_scroll() {
+        let (_tmp, path) = tmp_file("wide.txt", b"a]234567890123456789012345678901234567890");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.scroll_right();
+        assert_eq!(viewer.h_scroll, H_SCROLL_AMOUNT);
+    }
+
+    #[test]
+    fn scroll_right_stops_when_longest_line_at_pane_edge() {
+        // 30-char line, content width 10 → max = 30 + H_SCROLL_PADDING - 10 = 24
+        let (_tmp, path) = tmp_file("wide.txt", b"123456789012345678901234567890");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.visible_content_width = 10;
+
+        for _ in 0..100 {
+            viewer.scroll_right();
+        }
+        assert_eq!(viewer.h_scroll, 30 + H_SCROLL_PADDING - 10);
+    }
+
+    #[test]
+    fn scroll_right_no_scroll_when_content_fits_viewport() {
+        // 5-char line + padding = 9, content width 20 → content fits, no scrolling
+        let (_tmp, path) = tmp_file("short.txt", b"abcde\nhi");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.visible_content_width = 20;
+
+        viewer.scroll_right();
+        assert_eq!(viewer.h_scroll, 0);
+    }
+
+    #[test]
+    fn scroll_right_no_file_loaded_stays_zero() {
+        let mut viewer = FileViewer::new();
+        viewer.scroll_right();
+        assert_eq!(viewer.h_scroll, 0);
+    }
+
+    #[test]
+    fn scroll_left_decreases_h_scroll() {
+        let mut viewer = FileViewer::new();
+        viewer.h_scroll = 8;
+        viewer.scroll_left();
+        assert_eq!(viewer.h_scroll, 4);
+    }
+
+    #[test]
+    fn scroll_left_floors_at_zero() {
+        let mut viewer = FileViewer::new();
+        viewer.h_scroll = 2;
+        viewer.scroll_left();
+        assert_eq!(viewer.h_scroll, 0);
+    }
+
+    #[test]
+    fn skip_chars_in_spans_single_span() {
+        let spans = vec![Span::raw("Hello World")];
+        let result = skip_chars_in_spans(spans, 6);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].content.as_ref(), "World");
+    }
+
+    #[test]
+    fn skip_chars_in_spans_multi_span_preserves_style() {
+        let spans = vec![
+            Span::styled("Hello", Style::default().fg(Color::Red)),
+            Span::styled(" World", Style::default().fg(Color::Blue)),
+        ];
+        let result = skip_chars_in_spans(spans, 7);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].content.as_ref(), "orld");
+        assert_eq!(result[0].style, Style::default().fg(Color::Blue));
+    }
+
+    #[test]
+    fn skip_chars_in_spans_skip_exceeding_total_returns_empty() {
+        let spans = vec![Span::raw("Hello")];
+        let result = skip_chars_in_spans(spans, 10);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn skip_chars_in_spans_multibyte_chars() {
+        // "→" is 3 bytes but 1 character; skip should count characters, not bytes
+        let spans = vec![Span::raw(" → hello")];
+        let result = skip_chars_in_spans(spans, 3);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].content.as_ref(), "hello");
+    }
+
+    #[test]
+    fn skip_chars_in_spans_skip_zero_returns_unchanged() {
+        let spans = vec![Span::raw("Hello")];
+        let result = skip_chars_in_spans(spans, 0);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].content.as_ref(), "Hello");
+    }
+
+    #[test]
+    fn h_key_scrolls_left_in_viewer() {
+        let mut viewer = FileViewer::new();
+        viewer.h_scroll = 8;
+        viewer.handle_event(key(KeyCode::Char('h'))).unwrap();
+        assert_eq!(viewer.h_scroll, 4);
+    }
+
+    #[test]
+    fn l_key_scrolls_right_in_viewer() {
+        let (_tmp, path) = tmp_file("wide.txt", b"abcdefghijklmnopqrstuvwxyz");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.handle_event(key(KeyCode::Char('l'))).unwrap();
+        assert_eq!(viewer.h_scroll, H_SCROLL_AMOUNT);
+    }
+
+    #[test]
+    fn left_arrow_scrolls_left_in_viewer() {
+        let mut viewer = FileViewer::new();
+        viewer.h_scroll = 8;
+        viewer.handle_event(key(KeyCode::Left)).unwrap();
+        assert_eq!(viewer.h_scroll, 4);
+    }
+
+    #[test]
+    fn right_arrow_scrolls_right_in_viewer() {
+        let (_tmp, path) = tmp_file("wide.txt", b"abcdefghijklmnopqrstuvwxyz");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.handle_event(key(KeyCode::Right)).unwrap();
+        assert_eq!(viewer.h_scroll, H_SCROLL_AMOUNT);
     }
 }

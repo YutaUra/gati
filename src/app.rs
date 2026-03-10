@@ -6,6 +6,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
@@ -23,6 +24,30 @@ use crate::watcher::FsWatcher;
 
 const MIN_WIDTH: u16 = 40;
 const MIN_HEIGHT: u16 = 10;
+
+/// Minimum pane width in columns (absolute floor).
+const MIN_PANE_COLS: u16 = 10;
+/// Minimum pane width as percentage.
+const MIN_PANE_PERCENT: u16 = 10;
+/// Maximum tree pane width as percentage.
+const MAX_TREE_PERCENT: u16 = 70;
+/// Lines to scroll per mouse wheel tick.
+const MOUSE_SCROLL_LINES: usize = 5;
+
+/// Compute clamped tree width percentage from a desired column position.
+/// Returns a percentage in [min_percent, MAX_TREE_PERCENT] ensuring both panes
+/// are at least max(MIN_PANE_PERCENT%, MIN_PANE_COLS columns) wide.
+pub fn clamp_tree_percent(desired_cols: u16, terminal_width: u16) -> u16 {
+    if terminal_width == 0 {
+        return 30;
+    }
+    let min_cols = (terminal_width * MIN_PANE_PERCENT / 100).max(MIN_PANE_COLS);
+    let max_tree_cols = terminal_width * MAX_TREE_PERCENT / 100;
+    // Viewer also needs min_cols, so tree max is also terminal_width - min_cols
+    let max_tree_cols = max_tree_cols.min(terminal_width.saturating_sub(min_cols));
+    let clamped = desired_cols.clamp(min_cols, max_tree_cols);
+    (clamped as u32 * 100 / terminal_width as u32) as u16
+}
 
 /// Which pane is currently focused.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -62,6 +87,19 @@ pub struct App {
     pub comment_store: CommentStore,
     /// Current input mode.
     pub input_mode: InputMode,
+    /// Tree pane width as percentage of terminal width (default 30).
+    pub tree_width_percent: u16,
+    /// Whether the user is currently dragging the pane border.
+    pub resizing: bool,
+    /// Cached right-edge column of the tree pane (set during draw).
+    /// Used by mouse handler to detect clicks on the pane border.
+    pub border_column: u16,
+    /// Whether focus mode is active (tree pane hidden, viewer full width).
+    pub focus_mode: bool,
+    /// Saved tree width percentage to restore when exiting focus mode.
+    pub saved_tree_width_percent: u16,
+    /// Cached top Y coordinate of tree pane inner area (after top border).
+    pub tree_inner_y: u16,
 }
 
 impl App {
@@ -115,6 +153,12 @@ impl App {
             target_dir: target.dir.clone(),
             comment_store: CommentStore::new(),
             input_mode: InputMode::Normal,
+            tree_width_percent: 30,
+            resizing: false,
+            border_column: 0,
+            focus_mode: false,
+            saved_tree_width_percent: 30,
+            tree_inner_y: 0,
         })
     }
 
@@ -235,11 +279,13 @@ fn install_panic_hook() {
 fn init_terminal() -> anyhow::Result<DefaultTerminal> {
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
+    io::stdout().execute(EnableMouseCapture)?;
     let terminal = ratatui::init();
     Ok(terminal)
 }
 
 fn restore_terminal() -> anyhow::Result<()> {
+    io::stdout().execute(DisableMouseCapture)?;
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
     Ok(())
@@ -259,34 +305,49 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<(
         terminal.draw(|frame| draw(frame, app))?;
 
         if event::poll(poll_timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
+            match event::read()? {
+                Event::Mouse(mouse) => {
+                    handle_mouse(app, mouse, terminal.size()?.width);
                     continue;
                 }
-
-                // Handle modal input modes first
-                match &app.input_mode {
-                    InputMode::CommentInput { .. } => {
-                        handle_comment_input(app, key);
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
                         continue;
                     }
-                    InputMode::LineSelect { .. } => {
-                        if handle_line_select(app, key) {
+
+                    // Handle modal input modes first
+                    match &app.input_mode {
+                        InputMode::CommentInput { .. } => {
+                            handle_comment_input(app, key);
                             continue;
                         }
-                        // If not handled, fall through to normal
+                        InputMode::LineSelect { .. } => {
+                            if handle_line_select(app, key) {
+                                continue;
+                            }
+                            // If not handled, fall through to normal
+                        }
+                        InputMode::Normal => {}
                     }
-                    InputMode::Normal => {}
-                }
 
-                let action = match app.focus {
-                    Focus::Tree => app.file_tree.handle_event(key)?,
-                    Focus::Viewer => app.file_viewer.handle_event(key)?,
-                };
+                    // 'b' toggles focus mode in Normal mode (both panes)
+                    if key.code == crossterm::event::KeyCode::Char('b')
+                        && key.modifiers.is_empty()
+                    {
+                        toggle_focus_mode(app);
+                        continue;
+                    }
 
-                if app.handle_action(action) {
-                    return Ok(());
+                    let action = match app.focus {
+                        Focus::Tree => app.file_tree.handle_event(key)?,
+                        Focus::Viewer => app.file_viewer.handle_event(key)?,
+                    };
+
+                    if app.handle_action(action) {
+                        return Ok(());
+                    }
                 }
+                _ => {}
             }
         }
 
@@ -377,6 +438,119 @@ fn handle_line_select(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
     }
 }
 
+fn toggle_focus_mode(app: &mut App) {
+    if app.focus_mode {
+        // Exit focus mode: restore saved tree width
+        app.focus_mode = false;
+        app.tree_width_percent = app.saved_tree_width_percent;
+    } else {
+        // Enter focus mode: save current tree width, force viewer focus
+        app.saved_tree_width_percent = app.tree_width_percent;
+        app.focus_mode = true;
+        app.focus = Focus::Viewer;
+    }
+}
+
+fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent, terminal_width: u16) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let min_cols = (terminal_width * MIN_PANE_PERCENT / 100).max(MIN_PANE_COLS);
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let border = app.border_column;
+            if app.focus_mode {
+                // In focus mode, clicking near left edge (col 0-1) starts drag-to-restore
+                if mouse.column <= 1 {
+                    app.resizing = true;
+                }
+            } else if mouse.column.abs_diff(border) <= 1 {
+                app.resizing = true;
+            } else if mouse.column < border {
+                app.focus = Focus::Tree;
+                // Click-to-select tree entry
+                if mouse.row >= app.tree_inner_y {
+                    let inner_row = (mouse.row - app.tree_inner_y) as usize;
+                    let entry_idx = app.file_tree.scroll_offset + inner_row;
+                    if entry_idx < app.file_tree.model.entries.len() {
+                        app.file_tree.model.selected = entry_idx;
+                        if app.file_tree.model.entries[entry_idx].is_directory {
+                            let _ = app.file_tree.model.toggle_expand();
+                        } else {
+                            let path = app.file_tree.model.entries[entry_idx].path.clone();
+                            app.file_viewer.load_file(&path);
+                            if let Some(ref workdir) = app.git_workdir {
+                                let line_diff = diff::compute_line_diff(workdir, &path);
+                                let unified_diff = diff::compute_unified_diff(workdir, &path);
+                                app.file_viewer.set_diff(line_diff, unified_diff);
+                            }
+                        }
+                    }
+                }
+            } else {
+                app.focus = Focus::Viewer;
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if !app.resizing {
+                return;
+            }
+            if app.focus_mode {
+                // Drag-to-restore: exit focus mode when dragged past min_cols
+                if mouse.column >= min_cols {
+                    app.focus_mode = false;
+                    app.tree_width_percent = clamp_tree_percent(mouse.column, terminal_width);
+                }
+            } else {
+                // Drag-to-collapse: enter focus mode when dragged below min_cols
+                if mouse.column < min_cols {
+                    app.saved_tree_width_percent = app.tree_width_percent;
+                    app.focus_mode = true;
+                    app.focus = Focus::Viewer;
+                } else {
+                    app.tree_width_percent = clamp_tree_percent(mouse.column, terminal_width);
+                }
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            app.resizing = false;
+        }
+        MouseEventKind::ScrollDown => {
+            if app.focus_mode || mouse.column > app.border_column {
+                if mouse.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+                    app.file_viewer.scroll_right();
+                } else {
+                    app.file_viewer.scroll_down(MOUSE_SCROLL_LINES);
+                }
+            } else {
+                app.file_tree.scroll_down(MOUSE_SCROLL_LINES);
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if app.focus_mode || mouse.column > app.border_column {
+                if mouse.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+                    app.file_viewer.scroll_left();
+                } else {
+                    app.file_viewer.scroll_up(MOUSE_SCROLL_LINES);
+                }
+            } else {
+                app.file_tree.scroll_up(MOUSE_SCROLL_LINES);
+            }
+        }
+        MouseEventKind::ScrollLeft => {
+            if app.focus_mode || mouse.column > app.border_column {
+                app.file_viewer.scroll_left();
+            }
+        }
+        MouseEventKind::ScrollRight => {
+            if app.focus_mode || mouse.column > app.border_column {
+                app.file_viewer.scroll_right();
+            }
+        }
+        _ => {}
+    }
+}
+
 fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
@@ -389,18 +563,35 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let pane_area = main_chunks[0];
     let hint_area = main_chunks[1];
 
-    // Split panes: 30% tree, 70% viewer
-    let pane_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(pane_area);
+    // Split panes: dynamic ratio from app state, or full-width viewer in focus mode
+    let pane_chunks = if app.focus_mode {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(0), Constraint::Percentage(100)])
+            .split(pane_area)
+    } else {
+        let tree_pct = app.tree_width_percent;
+        let viewer_pct = 100u16.saturating_sub(tree_pct);
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(tree_pct),
+                Constraint::Percentage(viewer_pct),
+            ])
+            .split(pane_area)
+    };
 
     let tree_area = pane_chunks[0];
     let viewer_area = pane_chunks[1];
 
-    // Update visible height for scroll calculations
-    let tree_inner_height = tree_area.height.saturating_sub(2) as usize; // minus borders
-    app.file_tree.ensure_visible(tree_inner_height);
+    // Cache the border column for mouse hit-testing (0 in focus mode for drag-to-restore)
+    app.border_column = if app.focus_mode { 0 } else { tree_area.right() };
+    // Cache tree inner area top for click-to-select (top border = +1)
+    app.tree_inner_y = tree_area.y + 1;
+
+    // Set visible height so ensure_visible in event handlers uses the correct value
+    // (render_to_buffer also sets this, but we need it before the first render)
+    app.file_tree.visible_height = tree_area.height.saturating_sub(2) as usize;
 
     // Update file viewer's comments for current file
     if let Some(file) = app.file_viewer.current_file() {
@@ -422,6 +613,16 @@ fn draw(frame: &mut Frame, app: &mut App) {
     app.file_viewer
         .render_to_buffer(viewer_area, buf, app.focus == Focus::Viewer);
 
+    // Highlight border when resizing
+    if app.resizing && tree_area.right() > 0 {
+        let border_x = tree_area.right() - 1;
+        for y in tree_area.top()..tree_area.bottom() {
+            if let Some(cell) = buf.cell_mut((border_x, y)) {
+                cell.set_style(Style::default().fg(Color::Yellow));
+            }
+        }
+    }
+
     // Render key hint bar (or comment input)
     let hints: String = match &app.input_mode {
         InputMode::CommentInput { text, .. } => {
@@ -430,22 +631,25 @@ fn draw(frame: &mut Frame, app: &mut App) {
         InputMode::LineSelect { .. } => {
             "j/k extend  c comment  Esc cancel".into()
         }
+        InputMode::Normal if app.focus_mode => {
+            "j/k cursor  h/l scroll  Ctrl-d/Ctrl-u page  c comment  V select  e export  b restore tree  q quit".into()
+        }
         InputMode::Normal => match app.focus {
             Focus::Tree => {
                 if app.file_tree.search.is_some() {
                     "Enter confirm  Esc cancel  ↑/↓ navigate".into()
                 } else if app.git_workdir.is_some() {
-                    "j/k navigate  h/l fold/unfold  Enter open  / search  g changed  Tab switch  q quit".into()
+                    "j/k navigate  h/l fold/unfold  Enter open  / search  g changed  b focus  Tab switch  q quit".into()
                 } else {
-                    "j/k navigate  h/l fold/unfold  Enter open  / search  Tab switch pane  q quit".into()
+                    "j/k navigate  h/l fold/unfold  Enter open  / search  b focus  Tab switch pane  q quit".into()
                 }
             }
             Focus::Viewer => {
-                let mut h = String::from("j/k cursor  Ctrl-d/Ctrl-u page  c comment  V select  e export");
+                let mut h = String::from("j/k cursor  h/l scroll  Ctrl-d/Ctrl-u page  c comment  V select  e export");
                 if app.git_workdir.is_some() {
                     h.push_str("  d diff");
                 }
-                h.push_str("  Tab switch  q quit");
+                h.push_str("  b focus  Tab switch  q quit");
                 h
             }
         },
@@ -695,5 +899,515 @@ mod tests {
             }
             other => panic!("Expected LineSelect, got {:?}", other),
         }
+    }
+
+    // Resizable panes
+    #[test]
+    fn default_tree_width_percent_is_30() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let app = App::new(&make_target(tmp.path(), None)).unwrap();
+        assert_eq!(app.tree_width_percent, 30);
+        assert!(!app.resizing);
+    }
+
+    #[test]
+    fn clamp_tree_percent_enforces_minimum() {
+        // Terminal 100 cols wide: min = max(10, 10) = 10 cols → 10%
+        assert_eq!(clamp_tree_percent(5, 100), 10);
+        // Terminal 80 cols wide: min = max(8, 10) = 10 cols → 12%
+        assert_eq!(clamp_tree_percent(3, 80), 12);
+    }
+
+    #[test]
+    fn clamp_tree_percent_enforces_maximum() {
+        // Terminal 100 cols wide: max = min(70, 100-10) = 70 cols → 70%
+        assert_eq!(clamp_tree_percent(90, 100), 70);
+        // Terminal 40 cols wide: max = min(28, 40-10) = 28 cols → 70%
+        assert_eq!(clamp_tree_percent(35, 40), 70);
+    }
+
+    #[test]
+    fn clamp_tree_percent_allows_valid_values() {
+        // 50 cols on 100 terminal → 50%
+        assert_eq!(clamp_tree_percent(50, 100), 50);
+        // 30 cols on 100 terminal → 30%
+        assert_eq!(clamp_tree_percent(30, 100), 30);
+    }
+
+    #[test]
+    fn resizing_flag_can_be_toggled() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        assert!(!app.resizing);
+        app.resizing = true;
+        assert!(app.resizing);
+        app.resizing = false;
+        assert!(!app.resizing);
+    }
+
+    // Mouse drag resize
+    fn make_mouse_event(
+        kind: crossterm::event::MouseEventKind,
+        col: u16,
+    ) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column: col,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn mouse_down_near_border_starts_resizing() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.border_column = 30;
+
+        // Click exactly on border
+        let ev = make_mouse_event(crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), 30);
+        handle_mouse(&mut app, ev, 100);
+        assert!(app.resizing);
+    }
+
+    #[test]
+    fn mouse_down_away_from_border_does_not_start_resizing() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.border_column = 30;
+
+        // Click 5 columns away from border
+        let ev = make_mouse_event(crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), 25);
+        handle_mouse(&mut app, ev, 100);
+        assert!(!app.resizing);
+    }
+
+    #[test]
+    fn mouse_drag_while_resizing_updates_percent() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.resizing = true;
+
+        // Drag to column 50 on 100-col terminal → 50%
+        let ev = make_mouse_event(crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left), 50);
+        handle_mouse(&mut app, ev, 100);
+        assert_eq!(app.tree_width_percent, 50);
+    }
+
+    #[test]
+    fn mouse_drag_without_resizing_does_nothing() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        assert!(!app.resizing);
+
+        let ev = make_mouse_event(crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left), 50);
+        handle_mouse(&mut app, ev, 100);
+        assert_eq!(app.tree_width_percent, 30); // unchanged
+    }
+
+    #[test]
+    fn mouse_up_stops_resizing() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.resizing = true;
+
+        let ev = make_mouse_event(crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left), 50);
+        handle_mouse(&mut app, ev, 100);
+        assert!(!app.resizing);
+    }
+
+    // Focus mode tests
+    #[test]
+    fn default_focus_mode_is_false() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let app = App::new(&make_target(tmp.path(), None)).unwrap();
+        assert!(!app.focus_mode);
+        assert_eq!(app.saved_tree_width_percent, 30);
+    }
+
+    #[test]
+    fn toggle_focus_mode_entering_saves_tree_width() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.tree_width_percent = 40;
+
+        toggle_focus_mode(&mut app);
+
+        assert!(app.focus_mode);
+        assert_eq!(app.saved_tree_width_percent, 40);
+        assert_eq!(app.focus, Focus::Viewer);
+    }
+
+    #[test]
+    fn toggle_focus_mode_exiting_restores_tree_width() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.tree_width_percent = 40;
+
+        toggle_focus_mode(&mut app); // enter
+        assert!(app.focus_mode);
+
+        toggle_focus_mode(&mut app); // exit
+        assert!(!app.focus_mode);
+        assert_eq!(app.tree_width_percent, 40);
+    }
+
+    #[test]
+    fn drag_below_minimum_enters_focus_mode() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.resizing = true;
+        app.tree_width_percent = 20;
+
+        // Drag to column 5, well below min_cols (10) on 100-col terminal
+        let ev = make_mouse_event(crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left), 5);
+        handle_mouse(&mut app, ev, 100);
+
+        assert!(app.focus_mode);
+        assert_eq!(app.saved_tree_width_percent, 20);
+        assert_eq!(app.focus, Focus::Viewer);
+    }
+
+    #[test]
+    fn drag_from_left_edge_in_focus_mode_restores() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.focus_mode = true;
+        app.saved_tree_width_percent = 30;
+
+        // Click at left edge to start resize
+        let down = make_mouse_event(crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), 0);
+        handle_mouse(&mut app, down, 100);
+        assert!(app.resizing);
+
+        // Drag past min_cols to restore
+        let drag = make_mouse_event(crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left), 25);
+        handle_mouse(&mut app, drag, 100);
+
+        assert!(!app.focus_mode);
+        assert_eq!(app.tree_width_percent, 25);
+    }
+
+    // Mouse wheel scroll tests
+    fn create_long_file(dir: &std::path::Path) -> PathBuf {
+        let path = dir.join("long.rs");
+        let content: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn scroll_down_over_viewer_moves_scroll_offset() {
+        let tmp = setup_dir(&["placeholder"], &[]);
+        let long_file = create_long_file(tmp.path());
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.file_viewer.load_file(&long_file);
+        app.border_column = 30;
+        let initial_offset = app.file_viewer.scroll_offset;
+
+        // Scroll down at column 50 (over viewer pane)
+        let ev = make_mouse_event(crossterm::event::MouseEventKind::ScrollDown, 50);
+        handle_mouse(&mut app, ev, 100);
+
+        assert!(app.file_viewer.scroll_offset > initial_offset);
+        assert_eq!(app.file_viewer.scroll_offset, initial_offset + MOUSE_SCROLL_LINES);
+    }
+
+    #[test]
+    fn scroll_up_over_viewer_moves_scroll_offset() {
+        let tmp = setup_dir(&["placeholder"], &[]);
+        let long_file = create_long_file(tmp.path());
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.file_viewer.load_file(&long_file);
+        app.border_column = 30;
+        app.file_viewer.scroll_offset = 20;
+
+        let ev = make_mouse_event(crossterm::event::MouseEventKind::ScrollUp, 50);
+        handle_mouse(&mut app, ev, 100);
+
+        assert_eq!(app.file_viewer.scroll_offset, 20 - MOUSE_SCROLL_LINES);
+    }
+
+    #[test]
+    fn scroll_over_tree_pane_does_not_affect_viewer() {
+        let tmp = setup_dir(&["placeholder"], &[]);
+        let long_file = create_long_file(tmp.path());
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.file_viewer.load_file(&long_file);
+        app.border_column = 30;
+        let initial_offset = app.file_viewer.scroll_offset;
+
+        // Scroll at column 10 (over tree pane, before border)
+        let ev = make_mouse_event(crossterm::event::MouseEventKind::ScrollDown, 10);
+        handle_mouse(&mut app, ev, 100);
+
+        assert_eq!(app.file_viewer.scroll_offset, initial_offset);
+    }
+
+    // Mouse horizontal scroll tests
+    fn make_mouse_event_with_modifiers(
+        kind: crossterm::event::MouseEventKind,
+        col: u16,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column: col,
+            row: 5,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn shift_scroll_down_over_viewer_scrolls_right() {
+        let tmp = setup_dir(&["placeholder"], &[]);
+        let long_file = create_long_file(tmp.path());
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.file_viewer.load_file(&long_file);
+        app.border_column = 30;
+
+        let ev = make_mouse_event_with_modifiers(
+            crossterm::event::MouseEventKind::ScrollDown,
+            50,
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+        handle_mouse(&mut app, ev, 100);
+
+        assert_eq!(app.file_viewer.h_scroll, crate::file_viewer::H_SCROLL_AMOUNT);
+    }
+
+    #[test]
+    fn shift_scroll_up_over_viewer_scrolls_left() {
+        let tmp = setup_dir(&["placeholder"], &[]);
+        let long_file = create_long_file(tmp.path());
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.file_viewer.load_file(&long_file);
+        app.file_viewer.h_scroll = 8;
+        app.border_column = 30;
+
+        let ev = make_mouse_event_with_modifiers(
+            crossterm::event::MouseEventKind::ScrollUp,
+            50,
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+        handle_mouse(&mut app, ev, 100);
+
+        assert_eq!(app.file_viewer.h_scroll, 4);
+    }
+
+    #[test]
+    fn shift_scroll_over_tree_does_not_h_scroll() {
+        let tmp = setup_dir(&["placeholder"], &[]);
+        let long_file = create_long_file(tmp.path());
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.file_viewer.load_file(&long_file);
+        app.border_column = 30;
+
+        let ev = make_mouse_event_with_modifiers(
+            crossterm::event::MouseEventKind::ScrollDown,
+            10,
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+        handle_mouse(&mut app, ev, 100);
+
+        assert_eq!(app.file_viewer.h_scroll, 0);
+    }
+
+    // Mouse scroll over tree pane tests
+    #[test]
+    fn scroll_down_over_tree_pane_scrolls_tree() {
+        // Create enough files so the tree can scroll
+        let files: Vec<String> = (0..30).map(|i| format!("file{i:02}.rs")).collect();
+        let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+        let tmp = setup_dir(&file_refs, &[]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.border_column = 30;
+        app.file_tree.visible_height = 20;
+        let initial = app.file_tree.scroll_offset;
+
+        // Scroll at column 10 (over tree pane)
+        let ev = make_mouse_event(crossterm::event::MouseEventKind::ScrollDown, 10);
+        handle_mouse(&mut app, ev, 100);
+
+        assert!(app.file_tree.scroll_offset > initial);
+    }
+
+    #[test]
+    fn scroll_up_over_tree_pane_scrolls_tree() {
+        let files: Vec<String> = (0..30).map(|i| format!("file{i:02}.rs")).collect();
+        let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+        let tmp = setup_dir(&file_refs, &[]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.border_column = 30;
+        app.file_tree.visible_height = 20;
+        app.file_tree.scroll_offset = 10;
+        app.file_tree.model.selected = 15;
+
+        let ev = make_mouse_event(crossterm::event::MouseEventKind::ScrollUp, 10);
+        handle_mouse(&mut app, ev, 100);
+
+        assert!(app.file_tree.scroll_offset < 10);
+    }
+
+    fn make_mouse_event_at(
+        kind: crossterm::event::MouseEventKind,
+        col: u16,
+        row: u16,
+    ) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    // Mouse click on tree entry tests
+    #[test]
+    fn click_on_tree_file_entry_selects_it() {
+        let tmp = setup_dir(&["a.rs", "b.rs", "c.rs"], &[]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.border_column = 30;
+        app.tree_inner_y = 1; // inner area starts at row 1 (after top border)
+        app.file_tree.visible_height = 20;
+        app.file_tree.scroll_offset = 0;
+        assert_eq!(app.file_tree.model.selected, 0);
+
+        // Click on row 3 → inner row 2 → entry index 2 (c.rs)
+        let ev = make_mouse_event_at(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            5, 3,
+        );
+        handle_mouse(&mut app, ev, 100);
+
+        assert_eq!(app.file_tree.model.selected, 2);
+    }
+
+    #[test]
+    fn click_on_tree_directory_toggles_expand() {
+        let tmp = setup_dir(&["sub/child.rs"], &["sub"]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.border_column = 30;
+        app.tree_inner_y = 1;
+        app.file_tree.visible_height = 20;
+        app.file_tree.scroll_offset = 0;
+        // Entry 0 is "sub" directory
+        assert!(app.file_tree.model.entries[0].is_directory);
+        assert!(!app.file_tree.model.entries[0].is_expanded);
+
+        // Click on row 1 → inner row 0 → entry index 0 (sub/)
+        let ev = make_mouse_event_at(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            5, 1,
+        );
+        handle_mouse(&mut app, ev, 100);
+
+        assert!(app.file_tree.model.entries[0].is_expanded, "clicking directory should expand it");
+    }
+
+    #[test]
+    fn click_on_expanded_directory_collapses_it() {
+        let tmp = setup_dir(&["sub/child.rs"], &["sub"]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.border_column = 30;
+        app.tree_inner_y = 1;
+        app.file_tree.visible_height = 20;
+        app.file_tree.scroll_offset = 0;
+
+        // Expand sub first
+        app.file_tree.model.selected = 0;
+        app.file_tree.model.toggle_expand().unwrap();
+        assert!(app.file_tree.model.entries[0].is_expanded);
+
+        // Click on row 1 → entry 0 (sub/, expanded)
+        let ev = make_mouse_event_at(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            5, 1,
+        );
+        handle_mouse(&mut app, ev, 100);
+
+        assert!(!app.file_tree.model.entries[0].is_expanded, "clicking expanded directory should collapse it");
+    }
+
+    #[test]
+    fn click_on_tree_with_scroll_offset_selects_correct_entry() {
+        let files: Vec<String> = (0..20).map(|i| format!("file{i:02}.rs")).collect();
+        let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+        let tmp = setup_dir(&file_refs, &[]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.border_column = 30;
+        app.tree_inner_y = 1;
+        app.file_tree.visible_height = 10;
+        app.file_tree.scroll_offset = 5;
+
+        // Click on row 1 → inner row 0 → scroll_offset + 0 = entry 5
+        let ev = make_mouse_event_at(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            5, 1,
+        );
+        handle_mouse(&mut app, ev, 100);
+
+        assert_eq!(app.file_tree.model.selected, 5);
+    }
+
+    #[test]
+    fn click_beyond_tree_entries_is_noop() {
+        let tmp = setup_dir(&["a.rs", "b.rs"], &[]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.border_column = 30;
+        app.tree_inner_y = 1;
+        app.file_tree.visible_height = 20;
+        app.file_tree.scroll_offset = 0;
+        app.file_tree.model.selected = 0;
+
+        // Click on row 10 → inner row 9 → entry 9, but only 2 entries exist
+        let ev = make_mouse_event_at(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            5, 10,
+        );
+        handle_mouse(&mut app, ev, 100);
+
+        assert_eq!(app.file_tree.model.selected, 0, "selection should not change");
+    }
+
+    // Click-to-focus tests
+    #[test]
+    fn click_on_tree_pane_focuses_tree() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.border_column = 30;
+        app.focus = Focus::Viewer; // start focused on viewer
+
+        let ev = make_mouse_event(crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), 10);
+        handle_mouse(&mut app, ev, 100);
+
+        assert_eq!(app.focus, Focus::Tree);
+    }
+
+    #[test]
+    fn click_on_viewer_pane_focuses_viewer() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.border_column = 30;
+        app.focus = Focus::Tree; // start focused on tree
+
+        let ev = make_mouse_event(crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), 50);
+        handle_mouse(&mut app, ev, 100);
+
+        assert_eq!(app.focus, Focus::Viewer);
+    }
+
+    #[test]
+    fn click_on_border_does_not_change_focus() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+        app.border_column = 30;
+        app.focus = Focus::Tree;
+
+        // Click on border (within ±1 of border_column) starts resize, not focus change
+        let ev = make_mouse_event(crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), 30);
+        handle_mouse(&mut app, ev, 100);
+
+        assert_eq!(app.focus, Focus::Tree); // unchanged
     }
 }

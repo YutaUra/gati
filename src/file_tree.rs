@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -23,12 +24,21 @@ pub struct SearchState {
     root: std::path::PathBuf,
 }
 
+/// Time window for double-tap detection.
+const DOUBLE_TAP_THRESHOLD: Duration = Duration::from_millis(400);
+
 pub struct FileTree {
     pub model: FileTreeModel,
     /// Scroll offset for the tree view.
     pub scroll_offset: usize,
     /// Active search state (None when not searching).
     pub search: Option<SearchState>,
+    /// Cached visible height from last render, used for scroll calculations.
+    pub visible_height: usize,
+    /// Timestamp of last expand action (for double-tap recursive expand).
+    pub last_expand_time: Option<Instant>,
+    /// Timestamp of last collapse action (for double-tap fold-to-root).
+    pub last_collapse_time: Option<Instant>,
 }
 
 impl FileTree {
@@ -38,10 +48,13 @@ impl FileTree {
             model,
             scroll_offset: 0,
             search: None,
+            visible_height: 0,
+            last_expand_time: None,
+            last_collapse_time: None,
         })
     }
 
-    pub fn render_to_buffer(&self, area: Rect, buf: &mut Buffer, focused: bool) {
+    pub fn render_to_buffer(&mut self, area: Rect, buf: &mut Buffer, focused: bool) {
         let border_style = if focused {
             Style::default().fg(Color::Cyan)
         } else {
@@ -65,6 +78,7 @@ impl FileTree {
         block.render(area, buf);
 
         let visible_height = inner.height as usize;
+        self.visible_height = visible_height;
 
         for (i, entry) in self
             .model
@@ -141,6 +155,20 @@ impl FileTree {
         }
     }
 
+    /// Scroll tree viewport down by `lines`, clamping to max scroll position.
+    /// Does not move selection — selection may go off-screen.
+    pub fn scroll_down(&mut self, lines: usize) {
+        let total = self.model.entries.len();
+        let max = total.saturating_sub(self.visible_height);
+        self.scroll_offset = (self.scroll_offset + lines).min(max);
+    }
+
+    /// Scroll tree viewport up by `lines`, flooring at 0.
+    /// Does not move selection — selection may go off-screen.
+    pub fn scroll_up(&mut self, lines: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
     /// Ensure the selected item is visible by adjusting scroll_offset.
     pub fn ensure_visible(&mut self, visible_height: usize) {
         if visible_height == 0 {
@@ -151,6 +179,53 @@ impl FileTree {
         } else if self.model.selected >= self.scroll_offset + visible_height {
             self.scroll_offset = self.model.selected - visible_height + 1;
         }
+    }
+
+    /// Recursively expand all subdirectories under the currently selected directory.
+    fn expand_all(&mut self) -> anyhow::Result<()> {
+        let start = self.model.selected;
+        let start_depth = self.model.entries[start].depth;
+        let mut i = start;
+        while i < self.model.entries.len() {
+            // Stop before acting when we leave the subtree
+            if i > start && self.model.entries[i].depth <= start_depth {
+                break;
+            }
+            if self.model.entries[i].is_directory && !self.model.entries[i].is_expanded {
+                let saved = self.model.selected;
+                self.model.selected = i;
+                self.model.toggle_expand()?;
+                self.model.selected = saved;
+            }
+            i += 1;
+        }
+        Ok(())
+    }
+
+    /// Find the root-level (depth 0) ancestor of the currently selected entry.
+    fn find_root_ancestor_index(&self) -> Option<usize> {
+        let selected = self.model.selected;
+        if self.model.entries.get(selected)?.depth == 0 {
+            return Some(selected);
+        }
+        (0..selected)
+            .rev()
+            .find(|&i| self.model.entries[i].depth == 0)
+    }
+
+    /// Fold (collapse) up to the root-level ancestor and select it.
+    fn fold_to_root(&mut self) -> anyhow::Result<()> {
+        if let Some(root_idx) = self.find_root_ancestor_index() {
+            // Collapse the root ancestor (which collapses everything under it)
+            if self.model.entries[root_idx].is_directory && self.model.entries[root_idx].is_expanded {
+                self.model.selected = root_idx;
+                self.model.toggle_expand()?;
+            } else {
+                self.model.selected = root_idx;
+            }
+            self.ensure_visible(self.visible_height);
+        }
+        Ok(())
     }
 
     /// Move selection, returning the action (FileSelected if a file is now under cursor).
@@ -294,12 +369,12 @@ impl FileTree {
             }
             KeyCode::Down => {
                 let action = self.move_selection(1);
-                self.ensure_visible(20);
+                self.ensure_visible(self.visible_height);
                 Ok(action)
             }
             KeyCode::Up => {
                 let action = self.move_selection(-1);
-                self.ensure_visible(20);
+                self.ensure_visible(self.visible_height);
                 Ok(action)
             }
             _ => Ok(Action::None),
@@ -317,30 +392,52 @@ impl Component for FileTree {
         match (key.code, key.modifiers) {
             (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, _) => {
                 let action = self.move_selection(1);
-                self.ensure_visible(20);
+                self.ensure_visible(self.visible_height);
                 Ok(action)
             }
             (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, _) => {
                 let action = self.move_selection(-1);
-                self.ensure_visible(20);
+                self.ensure_visible(self.visible_height);
                 Ok(action)
             }
             (KeyCode::Char('l'), KeyModifiers::NONE) | (KeyCode::Right, _) => {
                 if let Some(entry) = self.model.selected_entry() {
-                    if entry.is_directory && !entry.is_expanded {
-                        self.model.toggle_expand()?;
+                    if entry.is_directory {
+                        let is_double_tap = self
+                            .last_expand_time
+                            .map_or(false, |t| t.elapsed() < DOUBLE_TAP_THRESHOLD);
+                        if !entry.is_expanded {
+                            self.model.toggle_expand()?;
+                            self.last_expand_time = Some(Instant::now());
+                        } else if is_double_tap {
+                            // Double-tap on expanded dir: recursively expand all
+                            self.expand_all()?;
+                            self.last_expand_time = None;
+                        } else {
+                            // Already expanded, record time for potential double-tap
+                            self.last_expand_time = Some(Instant::now());
+                        }
                     }
                 }
                 Ok(Action::None)
             }
             (KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Left, _) => {
                 if let Some(entry) = self.model.selected_entry() {
+                    let is_double_tap = self
+                        .last_collapse_time
+                        .map_or(false, |t| t.elapsed() < DOUBLE_TAP_THRESHOLD);
                     if entry.is_directory && entry.is_expanded {
                         self.model.toggle_expand()?;
+                        self.last_collapse_time = Some(Instant::now());
+                    } else if is_double_tap {
+                        // Double-tap: fold to root-level ancestor
+                        self.fold_to_root()?;
+                        self.last_collapse_time = None;
                     } else if let Some(parent_idx) = self.find_parent_index() {
                         self.model.selected = parent_idx;
                         self.model.toggle_expand()?;
-                        self.ensure_visible(20);
+                        self.ensure_visible(self.visible_height);
+                        self.last_collapse_time = Some(Instant::now());
                     }
                 }
                 Ok(Action::None)
@@ -361,7 +458,7 @@ impl Component for FileTree {
             (KeyCode::Char('g'), KeyModifiers::NONE) => {
                 self.model.toggle_filter()?;
                 self.scroll_offset = 0;
-                self.ensure_visible(20);
+                self.ensure_visible(self.visible_height);
                 Ok(Action::None)
             }
             (KeyCode::Tab, _) => Ok(Action::SwitchFocus),
@@ -660,5 +757,276 @@ mod tests {
         let mut tree = FileTree::new(tmp.path(), None).unwrap();
         let action = tree.handle_event(key(KeyCode::Char('q'))).unwrap();
         assert_eq!(action, Action::Quit);
+    }
+
+    #[test]
+    fn scroll_down_increases_scroll_offset() {
+        let files: Vec<String> = (0..30).map(|i| format!("file{i:02}.rs")).collect();
+        let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+        let tmp = setup_dir(&file_refs, &[]);
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
+        tree.visible_height = 20;
+        assert_eq!(tree.scroll_offset, 0);
+
+        tree.scroll_down(3);
+        assert_eq!(tree.scroll_offset, 3);
+        // Selection should NOT move — viewport-only scroll
+        assert_eq!(tree.model.selected, 0);
+    }
+
+    #[test]
+    fn scroll_up_decreases_scroll_offset() {
+        let files: Vec<String> = (0..30).map(|i| format!("file{i:02}.rs")).collect();
+        let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+        let tmp = setup_dir(&file_refs, &[]);
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
+        tree.visible_height = 20;
+        tree.scroll_offset = 10;
+        tree.model.selected = 15;
+
+        tree.scroll_up(3);
+        assert_eq!(tree.scroll_offset, 7);
+        // Selection should NOT move
+        assert_eq!(tree.model.selected, 15);
+    }
+
+    #[test]
+    fn scroll_down_clamps_at_max() {
+        let tmp = setup_dir(&["a.rs", "b.rs", "c.rs"], &[]);
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
+        tree.visible_height = 10;
+
+        tree.scroll_down(100);
+        // 3 items, visible_height 10 → max scroll is 0 (all fit)
+        assert_eq!(tree.scroll_offset, 0);
+    }
+
+    #[test]
+    fn scroll_up_floors_at_zero() {
+        let tmp = setup_dir(&["a.rs", "b.rs"], &[]);
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
+        tree.visible_height = 10;
+        tree.scroll_offset = 0;
+
+        tree.scroll_up(5);
+        assert_eq!(tree.scroll_offset, 0);
+    }
+
+    #[test]
+    fn keyboard_nav_brings_offscreen_selection_into_view() {
+        let files: Vec<String> = (0..30).map(|i| format!("file{i:02}.rs")).collect();
+        let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+        let tmp = setup_dir(&file_refs, &[]);
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
+        tree.visible_height = 10;
+
+        // Selection at 0, scroll viewport so selection is off-screen
+        tree.scroll_offset = 15;
+        assert_eq!(tree.model.selected, 0); // off-screen (above viewport)
+
+        // Press j — selection moves to 1, ensure_visible should bring viewport back
+        tree.handle_event(key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(tree.model.selected, 1);
+        assert!(tree.scroll_offset <= tree.model.selected,
+            "viewport should scroll to show selection: offset={}, selected={}",
+            tree.scroll_offset, tree.model.selected);
+    }
+
+    #[test]
+    fn no_scroll_when_all_items_fit_in_visible_height() {
+        // 5 files in a tree with visible_height=40 — should never scroll
+        let tmp = setup_dir(&["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"], &[]);
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
+        tree.visible_height = 40;
+
+        // Move to the last item
+        for _ in 0..4 {
+            tree.handle_event(key(KeyCode::Char('j'))).unwrap();
+        }
+        assert_eq!(tree.model.selected, 4);
+        assert_eq!(tree.scroll_offset, 0, "should not scroll when all items fit");
+    }
+
+    // Double-tap expand/collapse tests
+    #[test]
+    fn double_tap_l_expands_all_subdirectories() {
+        // Structure: parent/ -> child/ -> grandchild/ -> file.rs
+        let tmp = setup_dir(
+            &["parent/child/grandchild/file.rs"],
+            &["parent", "parent/child", "parent/child/grandchild"],
+        );
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
+        tree.visible_height = 40;
+        // First entry is "parent" directory
+        assert!(tree.model.entries[0].is_directory);
+        assert!(!tree.model.entries[0].is_expanded);
+
+        // First l: expand parent (normal)
+        tree.handle_event(key(KeyCode::Char('l'))).unwrap();
+        assert!(tree.model.entries[0].is_expanded);
+        // Only parent's immediate children should be visible, child/ not expanded
+        let child = tree.model.entries.iter().find(|e| e.name() == "child").unwrap();
+        assert!(!child.is_expanded);
+
+        // Simulate double-tap: set last_expand_time to now
+        tree.last_expand_time = Some(std::time::Instant::now());
+        // Second l: should recursively expand all subdirectories
+        tree.handle_event(key(KeyCode::Char('l'))).unwrap();
+
+        // All directories should be expanded
+        for entry in &tree.model.entries {
+            if entry.is_directory {
+                assert!(entry.is_expanded, "directory '{}' should be expanded", entry.name());
+            }
+        }
+        // file.rs should be present
+        assert!(tree.model.entries.iter().any(|e| e.name() == "file.rs"));
+    }
+
+    #[test]
+    fn double_tap_l_does_not_expand_sibling_folder() {
+        // Structure: alpha/ -> inner/ -> file.rs
+        //            beta/  -> other.rs
+        // Double-tap on alpha should NOT expand beta
+        let tmp = setup_dir(
+            &["alpha/inner/file.rs", "beta/other.rs"],
+            &["alpha", "alpha/inner", "beta"],
+        );
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
+        tree.visible_height = 40;
+        // Entries sorted: alpha/ (dir), beta/ (dir)
+        assert_eq!(tree.model.entries[0].name(), "alpha");
+        assert_eq!(tree.model.entries[1].name(), "beta");
+
+        // Expand alpha
+        tree.handle_event(key(KeyCode::Char('l'))).unwrap();
+        assert!(tree.model.entries[0].is_expanded);
+
+        // Double-tap: recursive expand alpha
+        tree.last_expand_time = Some(std::time::Instant::now());
+        tree.handle_event(key(KeyCode::Char('l'))).unwrap();
+
+        // alpha and its children should be expanded
+        let alpha = tree.model.entries.iter().find(|e| e.name() == "alpha").unwrap();
+        assert!(alpha.is_expanded);
+        let inner = tree.model.entries.iter().find(|e| e.name() == "inner").unwrap();
+        assert!(inner.is_expanded);
+
+        // beta must NOT be expanded
+        let beta = tree.model.entries.iter().find(|e| e.name() == "beta").unwrap();
+        assert!(!beta.is_expanded, "sibling folder 'beta' should not be expanded by double-tap on 'alpha'");
+    }
+
+    #[test]
+    fn single_l_on_expanded_dir_is_noop_without_double_tap() {
+        let tmp = setup_dir(&["sub/child.rs"], &["sub"]);
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
+        tree.visible_height = 40;
+
+        // Expand sub
+        tree.handle_event(key(KeyCode::Char('l'))).unwrap();
+        assert!(tree.model.entries[0].is_expanded);
+        let count = tree.model.entries.len();
+
+        // Clear timing so it's not a double-tap
+        tree.last_expand_time = None;
+
+        // Second l without double-tap: should be noop
+        tree.handle_event(key(KeyCode::Char('l'))).unwrap();
+        assert_eq!(tree.model.entries.len(), count);
+    }
+
+    #[test]
+    fn double_tap_l_on_already_expanded_dir_expands_all() {
+        // Structure: parent/ -> child/ -> file.rs
+        let tmp = setup_dir(
+            &["parent/child/file.rs"],
+            &["parent", "parent/child"],
+        );
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
+        tree.visible_height = 40;
+
+        // Expand parent normally (not via double-tap)
+        tree.handle_event(key(KeyCode::Char('l'))).unwrap();
+        assert!(tree.model.entries[0].is_expanded);
+        // child/ is visible but not expanded
+        let child = tree.model.entries.iter().find(|e| e.name() == "child").unwrap();
+        assert!(!child.is_expanded);
+
+        // Clear timing to simulate time passing
+        tree.last_expand_time = None;
+
+        // First l on already-expanded parent: should record time
+        tree.handle_event(key(KeyCode::Char('l'))).unwrap();
+
+        // Second l quickly (simulated by last_expand_time being recent):
+        // last_expand_time should have been set by previous l
+        tree.handle_event(key(KeyCode::Char('l'))).unwrap();
+
+        // All subdirectories should now be expanded
+        for entry in &tree.model.entries {
+            if entry.is_directory {
+                assert!(entry.is_expanded, "directory '{}' should be expanded", entry.name());
+            }
+        }
+        assert!(tree.model.entries.iter().any(|e| e.name() == "file.rs"));
+    }
+
+    #[test]
+    fn double_tap_h_folds_to_root_parent() {
+        // Structure: parent/ -> child/ -> file.rs
+        let tmp = setup_dir(
+            &["parent/child/file.rs"],
+            &["parent", "parent/child"],
+        );
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
+        tree.visible_height = 40;
+
+        // Expand parent and child
+        tree.handle_event(key(KeyCode::Char('l'))).unwrap(); // expand parent
+        tree.model.selected = 1; // select child
+        tree.handle_event(key(KeyCode::Char('l'))).unwrap(); // expand child
+        // Move to file.rs
+        tree.model.selected = 2;
+        assert_eq!(tree.model.entries[2].name(), "file.rs");
+
+        // First h: normal fold — goes to parent dir "child" and collapses it
+        tree.handle_event(key(KeyCode::Char('h'))).unwrap();
+        assert_eq!(tree.model.entries[tree.model.selected].name(), "child");
+        assert!(!tree.model.entries[tree.model.selected].is_expanded);
+
+        // Simulate double-tap
+        tree.last_collapse_time = Some(std::time::Instant::now());
+        // Second h: should fold all the way to root parent ("parent") and collapse
+        tree.handle_event(key(KeyCode::Char('h'))).unwrap();
+        assert_eq!(tree.model.selected, 0);
+        assert_eq!(tree.model.entries[0].name(), "parent");
+        assert!(!tree.model.entries[0].is_expanded);
+    }
+
+    #[test]
+    fn single_h_without_double_tap_only_folds_to_parent() {
+        // Structure: parent/ -> child/ -> file.rs
+        let tmp = setup_dir(
+            &["parent/child/file.rs"],
+            &["parent", "parent/child"],
+        );
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
+        tree.visible_height = 40;
+
+        // Expand parent
+        tree.handle_event(key(KeyCode::Char('l'))).unwrap();
+        // Select child (collapsed)
+        tree.model.selected = 1;
+        assert_eq!(tree.model.entries[1].name(), "child");
+
+        // Clear timing
+        tree.last_collapse_time = None;
+
+        // h: normal — goes to parent and collapses
+        tree.handle_event(key(KeyCode::Char('h'))).unwrap();
+        assert_eq!(tree.model.selected, 0);
+        assert_eq!(tree.model.entries[0].name(), "parent");
+        assert!(!tree.model.entries[0].is_expanded);
     }
 }
