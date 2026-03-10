@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-03-10
+
+### Added
+
+- Syntax highlighting in file viewer using syntect (base16-eighties theme)
+- Language detection from file extension (Rust, Python, JavaScript, Markdown, TOML, etc.)
+- First-line fallback detection for shebang lines (e.g., `#!/bin/bash`)
+- Plain text fallback for files with unrecognized extensions
+
 ## [0.1.0] - 2026-03-10
 
 ### Added
