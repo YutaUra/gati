@@ -83,7 +83,7 @@ You have full context of the OpenSpec system. Use it naturally, don't force it.
 
 At the start, quickly check what exists:
 ```bash
-openspec list --json
+npx openspec list --json
 ```
 
 This tells you:
@@ -201,7 +201,7 @@ You: [reads codebase]
 
 **User is stuck mid-implementation:**
 ```
-User: /opsx:explore add-auth-system
+User: openspec-explore add-auth-system
       The OAuth integration is more complex than expected
 
 You: [reads change artifacts]
