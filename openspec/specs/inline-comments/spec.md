@@ -1,3 +1,24 @@
+### Requirement: File viewer supports a cursor line
+
+The system SHALL provide a visible cursor line in the file viewer that indicates the current line. The cursor line is distinct from scrolling — scrolling moves the viewport, while the cursor line indicates a specific line within the viewport. The cursor line is needed to support line-specific actions such as commenting.
+
+#### Scenario: Cursor line is visible
+
+- **WHEN** a file is displayed in the viewer
+- **THEN** one line is highlighted as the cursor line (e.g., subtle background highlight)
+
+#### Scenario: Move cursor with j/k when viewer is focused
+
+- **WHEN** the file viewer is focused and the user presses j or k
+- **THEN** the cursor line moves down or up by one line
+- **AND** the viewport scrolls if the cursor moves beyond the visible area
+
+#### Scenario: Cursor line is independent of scroll position
+
+- **WHEN** the user scrolls with Ctrl-d/Ctrl-u
+- **THEN** the cursor line stays on its current file line number, and the viewport moves
+- **AND** if the cursor line scrolls out of view, it is clamped to the viewport edge
+
 ### Requirement: Users can leave inline comments on file lines
 
 The system SHALL allow users to create inline comments on any line (or range of lines) in the file viewer. Comments are displayed inline between code lines, similar to GitHub PR review comments.

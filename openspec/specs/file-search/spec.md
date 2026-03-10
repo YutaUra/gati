@@ -11,8 +11,14 @@ The system SHALL provide an incremental search mode that filters the file tree t
 #### Scenario: Incremental filtering as user types
 
 - **WHEN** the user types characters in the search input
-- **THEN** the file tree incrementally filters to show only files (and their ancestor directories) whose names contain the query substring
+- **THEN** the file tree incrementally filters to show only files (and their ancestor directories) whose file name (not full path) contains the query substring
 - **AND** the matching portion of file names is visually highlighted
+
+#### Scenario: Search matches file name only, not directory path
+
+- **WHEN** the user searches for `main`
+- **THEN** files named `main.rs`, `main_test.rs` etc. match regardless of their directory
+- **AND** directory names like `maintenance/` do not match unless they contain a matching file
 
 #### Scenario: Case-insensitive matching
 

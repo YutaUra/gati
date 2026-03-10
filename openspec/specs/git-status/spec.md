@@ -1,6 +1,6 @@
 ### Requirement: File tree displays git status markers
 
-The system SHALL display git status markers next to each file entry in the file tree when inside a git repository. Status markers indicate how each file has changed relative to the HEAD commit. Directories SHALL aggregate the status of their children — a directory marker reflects the "most significant" change among its descendants.
+The system SHALL display git status markers next to each file entry in the file tree when inside a git repository. Status markers indicate how each file has changed in the working tree or index relative to HEAD. Directories SHALL display a generic change indicator (e.g., `[●]`) when any descendant has changes, rather than aggregating specific status types.
 
 #### Scenario: Modified file shows marker
 
@@ -25,17 +25,22 @@ The system SHALL display git status markers next to each file entry in the file 
 #### Scenario: Renamed file shows marker
 
 - **WHEN** a file has been renamed (detected by git)
-- **THEN** the file tree displays `[R]` next to the file name
+- **THEN** the file tree displays `[R]` next to the file name in a distinct color (e.g., blue)
+
+#### Scenario: File with both staged and unstaged changes
+
+- **WHEN** a file has been partially staged (some changes staged, others not)
+- **THEN** the file tree displays `[M]` (the working tree status takes visual priority)
 
 #### Scenario: Unchanged file has no marker
 
 - **WHEN** a file has no changes relative to HEAD
 - **THEN** no status marker is displayed next to the file name
 
-#### Scenario: Directory aggregates child statuses
+#### Scenario: Directory indicates changed descendants
 
 - **WHEN** a directory contains one or more files with git status changes
-- **THEN** the directory entry displays a marker reflecting the presence of changes (e.g., `[M]` if any child is modified)
+- **THEN** the directory entry displays `[●]` in a distinct color to indicate it contains changes
 
 #### Scenario: Non-git directory shows no markers
 

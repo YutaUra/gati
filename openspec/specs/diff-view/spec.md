@@ -1,6 +1,25 @@
+### Requirement: Full file mode shows change gutter markers
+
+The system SHALL display gutter markers in normal (full file) mode to indicate which lines have been changed relative to HEAD. This allows the user to see changes in context without switching to diff mode.
+
+#### Scenario: Changed lines show gutter indicator
+
+- **WHEN** viewing a file in normal mode that has modified lines relative to HEAD
+- **THEN** changed lines display a gutter indicator (e.g., `▎` in yellow) in the line number gutter
+
+#### Scenario: Added lines show gutter indicator
+
+- **WHEN** viewing a file in normal mode that has newly added lines relative to HEAD
+- **THEN** added lines display a gutter indicator (e.g., `▎` in green) in the line number gutter
+
+#### Scenario: No gutter markers outside git
+
+- **WHEN** the application is running outside a git repository
+- **THEN** no gutter markers are displayed in normal mode
+
 ### Requirement: File viewer supports diff mode
 
-The system SHALL provide a diff mode in the file viewer that shows a unified diff of the selected file's changes relative to HEAD. The user SHALL be able to toggle between normal (full file) mode and diff mode.
+The system SHALL provide a diff mode in the file viewer that shows a unified diff of the selected file's changes. The diff compares the working tree version against HEAD. The user SHALL be able to toggle between normal (full file) mode and diff mode.
 
 #### Scenario: Toggle diff mode with d key
 

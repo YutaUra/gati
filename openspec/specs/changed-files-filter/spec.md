@@ -4,9 +4,9 @@ The system SHALL allow the user to toggle the file tree between "all files" mode
 
 #### Scenario: Toggle changed-files filter
 
-- **WHEN** the file tree is focused and the user presses `g` (or a designated filter key)
+- **WHEN** the file tree is focused and the user presses `g`
 - **THEN** the file tree switches to showing only changed files and their ancestor directories
-- **AND** pressing the same key again returns to showing all files
+- **AND** pressing `g` again returns to showing all files
 
 #### Scenario: Changed-files mode shows only modified, added, deleted, and renamed files
 
