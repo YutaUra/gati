@@ -10,6 +10,7 @@ use ratatui::{
 };
 
 use crate::components::{Action, Component};
+use crate::highlight::Highlighter;
 
 /// Content to display in the file viewer.
 #[derive(Debug, Clone, PartialEq)]
@@ -20,6 +21,9 @@ pub enum ViewerContent {
     File {
         path: PathBuf,
         lines: Vec<String>,
+        /// Name of the detected syntax (e.g., "Rust", "Python", "Plain Text").
+        /// Stored as a String to avoid lifetime issues with SyntaxReference.
+        syntax_name: String,
     },
     /// Binary file detected.
     Binary(PathBuf),
@@ -34,6 +38,7 @@ pub struct FileViewer {
     pub scroll_offset: usize,
     /// Height of the viewer (set during render, used for half-page scroll).
     pub visible_height: usize,
+    highlighter: Highlighter,
 }
 
 impl FileViewer {
@@ -42,6 +47,7 @@ impl FileViewer {
             content: ViewerContent::Placeholder,
             scroll_offset: 0,
             visible_height: 20,
+            highlighter: Highlighter::new(),
         }
     }
 
@@ -76,9 +82,13 @@ impl FileViewer {
         }
 
         let lines: Vec<String> = text.lines().map(String::from).collect();
+        let first_line = lines.first().map(|s| s.as_str()).unwrap_or("");
+        let syntax = self.highlighter.detect_syntax(path, first_line);
+        let syntax_name = syntax.name.clone();
         self.content = ViewerContent::File {
             path: path.to_path_buf(),
             lines,
+            syntax_name,
         };
     }
 
@@ -138,8 +148,26 @@ impl FileViewer {
                 let line = Line::from(Span::styled(msg.as_str(), Style::default().fg(Color::Red)));
                 buf.set_line(inner.x, inner.y, &line, inner.width);
             }
-            ViewerContent::File { lines, .. } => {
+            ViewerContent::File {
+                lines,
+                syntax_name,
+                ..
+            } => {
                 let gutter_width = line_number_width(lines.len());
+
+                // Look up syntax by name and create highlight state
+                let syntax = self
+                    .highlighter
+                    .syntax_set
+                    .find_syntax_by_name(syntax_name)
+                    .unwrap_or_else(|| self.highlighter.syntax_set.find_syntax_plain_text());
+                let mut hl_state = self.highlighter.new_highlight_state(syntax);
+
+                // Advance highlight state past lines before scroll_offset
+                for line_text in lines.iter().take(self.scroll_offset) {
+                    // Feed lines to keep parse state correct, discard results
+                    let _ = self.highlighter.highlight_line(&mut hl_state, &format!("{line_text}\n"));
+                }
 
                 for (i, line_text) in lines
                     .iter()
@@ -150,10 +178,11 @@ impl FileViewer {
                     let line_num = self.scroll_offset + i + 1;
                     let num_str = format!("{:>width$} ", line_num, width = gutter_width);
 
-                    let line = Line::from(vec![
-                        Span::styled(num_str, Style::default().fg(Color::DarkGray)),
-                        Span::raw(line_text),
-                    ]);
+                    let mut spans = vec![Span::styled(num_str, Style::default().fg(Color::DarkGray))];
+                    let highlighted = self.highlighter.highlight_line(&mut hl_state, &format!("{line_text}\n"));
+                    spans.extend(highlighted);
+
+                    let line = Line::from(spans);
 
                     let y = inner.y + i as u16;
                     if y < inner.y + inner.height {
@@ -418,5 +447,91 @@ mod tests {
         let mut viewer = FileViewer::new();
         let action = viewer.handle_event(key(KeyCode::Char('q'))).unwrap();
         assert_eq!(action, Action::Quit);
+    }
+
+    // Syntax highlighting integration
+    #[test]
+    fn load_file_detects_rust_syntax() {
+        let (_tmp, path) = tmp_file("test.rs", b"fn main() {}\n");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+
+        match &viewer.content {
+            ViewerContent::File { syntax_name, .. } => {
+                assert_eq!(syntax_name, "Rust");
+            }
+            other => panic!("Expected File content, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_file_falls_back_to_plain_text_for_unknown_extension() {
+        let (_tmp, path) = tmp_file("data.xyz999", b"some content\n");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+
+        match &viewer.content {
+            ViewerContent::File { syntax_name, .. } => {
+                assert_eq!(syntax_name, "Plain Text");
+            }
+            other => panic!("Expected File content, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn render_highlighted_file_does_not_panic() {
+        let (_tmp, path) = tmp_file("test.rs", b"fn main() {\n    println!(\"hello\");\n}\n");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+
+        let area = Rect::new(0, 0, 60, 10);
+        let mut buf = Buffer::empty(area);
+        viewer.render_to_buffer(area, &mut buf, true);
+        // Should not panic; content should be rendered
+    }
+
+    #[test]
+    fn render_plain_text_file_does_not_panic() {
+        let (_tmp, path) = tmp_file("notes.xyz999", b"line 1\nline 2\n");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+
+        let area = Rect::new(0, 0, 40, 5);
+        let mut buf = Buffer::empty(area);
+        viewer.render_to_buffer(area, &mut buf, true);
+    }
+
+    #[test]
+    fn binary_file_unaffected_by_highlighting() {
+        let data = vec![0x48, 0x65, 0x00, 0x6C, 0x6C, 0x6F];
+        let (_tmp, path) = tmp_file("image.png", &data);
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+
+        assert!(matches!(viewer.content, ViewerContent::Binary(_)));
+        let area = Rect::new(0, 0, 40, 5);
+        let mut buf = Buffer::empty(area);
+        viewer.render_to_buffer(area, &mut buf, true);
+    }
+
+    #[test]
+    fn empty_file_unaffected_by_highlighting() {
+        let (_tmp, path) = tmp_file("empty.rs", b"");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+
+        assert!(matches!(viewer.content, ViewerContent::Empty(_)));
+        let area = Rect::new(0, 0, 40, 5);
+        let mut buf = Buffer::empty(area);
+        viewer.render_to_buffer(area, &mut buf, true);
+    }
+
+    #[test]
+    fn placeholder_unaffected_by_highlighting() {
+        let mut viewer = FileViewer::new();
+        assert_eq!(viewer.content, ViewerContent::Placeholder);
+        let area = Rect::new(0, 0, 40, 5);
+        let mut buf = Buffer::empty(area);
+        viewer.render_to_buffer(area, &mut buf, false);
     }
 }

@@ -2,6 +2,7 @@ mod app;
 mod components;
 mod file_tree;
 mod file_viewer;
+mod highlight;
 mod tree;
 
 use std::path::PathBuf;
