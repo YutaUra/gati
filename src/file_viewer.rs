@@ -9,6 +9,9 @@ use ratatui::{
     widgets::{Block, Borders, Widget},
 };
 
+use syntect::highlighting::HighlightState;
+use syntect::parsing::ParseState;
+
 use crate::comments::Comment;
 use crate::components::{Action, Component};
 
@@ -22,6 +25,20 @@ pub const H_SCROLL_AMOUNT: usize = 4;
 const H_SCROLL_PADDING: usize = 2;
 /// Extra padding (in lines) added beyond the last line for vertical scroll.
 const V_SCROLL_PADDING: usize = 1;
+
+/// Minimum inner width (in columns) below which the minimap is hidden.
+const MINIMAP_MIN_WIDTH: u16 = 30;
+/// Width of the minimap in terminal columns.
+const MINIMAP_WIDTH: u16 = 2;
+
+/// Color of a minimap marker for a given row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MinimapMarker {
+    Added,
+    Modified,
+    Removed,
+    Comment,
+}
 
 /// Content to display in the file viewer.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,9 +73,14 @@ pub struct FileViewer {
     /// Width available for code content in characters (set during render, excludes gutter).
     pub visible_content_width: usize,
     highlighter: Highlighter,
-    /// Pre-computed highlighted spans for each line (populated on file load).
-    /// Avoids re-highlighting on every render, which was O(scroll_offset).
+    /// Incrementally-computed highlighted spans for file lines.
+    /// May be shorter than total lines; remaining lines are computed on demand
+    /// during render via `ensure_highlighted_up_to`.
     highlighted_lines: Vec<Vec<Span<'static>>>,
+    /// Saved syntect state after the last highlighted line, enabling incremental
+    /// highlighting without replaying from the beginning.
+    hl_parse_state: Option<ParseState>,
+    hl_highlight_state: Option<HighlightState>,
     /// Per-line diff info for gutter markers in normal mode.
     pub line_diff: Option<LineDiff>,
     /// Parsed unified diff for diff mode.
@@ -69,6 +91,8 @@ pub struct FileViewer {
     pub diff_mode: bool,
     /// Comments for the currently viewed file (set before each render by App).
     pub comments: Vec<Comment>,
+    /// Cached minimap rectangle from the last render (for mouse hit-testing).
+    pub minimap_rect: Option<Rect>,
 }
 
 impl FileViewer {
@@ -82,57 +106,122 @@ impl FileViewer {
             visible_content_width: 0,
             highlighter: Highlighter::new(),
             highlighted_lines: Vec::new(),
+            hl_parse_state: None,
+            hl_highlight_state: None,
             line_diff: None,
             unified_diff: None,
             diff_highlighted_lines: Vec::new(),
             diff_mode: false,
             comments: Vec::new(),
+            minimap_rect: None,
         }
     }
 
     /// Set diff data for the currently loaded file.
+    ///
+    /// Syntax highlighting for diff lines is deferred until diff mode is
+    /// actually rendered (see `ensure_diff_highlighted`), avoiding expensive
+    /// O(n) syntect work on every file selection.
     pub fn set_diff(&mut self, line_diff: Option<LineDiff>, unified_diff: Option<UnifiedDiff>) {
         self.line_diff = line_diff;
         self.diff_highlighted_lines.clear();
+        self.unified_diff = unified_diff;
+    }
 
-        // Pre-compute syntax-highlighted spans for diff lines using the file's language
-        if let Some(ref diff) = unified_diff {
-            let syntax = match &self.content {
-                ViewerContent::File { path, .. } => {
-                    let first_line = diff.lines.iter().find_map(|l| match l {
-                        UnifiedDiffLine::Context(s) | UnifiedDiffLine::Added(s) => Some(s.as_str()),
-                        _ => None,
-                    }).unwrap_or("");
-                    self.highlighter.detect_syntax(path, first_line).name.clone()
+    /// Lazily compute syntax-highlighted spans for unified diff lines.
+    ///
+    /// Called on the first diff-mode render after `set_diff`. Subsequent
+    /// calls are no-ops while the cached highlights remain valid.
+    fn ensure_diff_highlighted(&mut self) {
+        if !self.diff_highlighted_lines.is_empty() {
+            return;
+        }
+        let diff = match self.unified_diff {
+            Some(ref d) => d,
+            None => return,
+        };
+
+        let syntax = match &self.content {
+            ViewerContent::File { path, .. } => {
+                let first_line = diff.lines.iter().find_map(|l| match l {
+                    UnifiedDiffLine::Context(s) | UnifiedDiffLine::Added(s) => Some(s.as_str()),
+                    _ => None,
+                }).unwrap_or("");
+                self.highlighter.detect_syntax(path, first_line).name.clone()
+            }
+            _ => "Plain Text".to_string(),
+        };
+
+        let syntax_ref = self.highlighter.syntax_set
+            .find_syntax_by_name(&syntax)
+            .unwrap_or_else(|| self.highlighter.syntax_set.find_syntax_plain_text());
+        let mut hl_state = self.highlighter.new_highlight_state(syntax_ref);
+
+        for diff_line in &diff.lines {
+            match diff_line {
+                UnifiedDiffLine::HunkHeader(_) => {
+                    self.diff_highlighted_lines.push(Vec::new());
                 }
-                _ => "Plain Text".to_string(),
-            };
-
-            let syntax_ref = self.highlighter.syntax_set
-                .find_syntax_by_name(&syntax)
-                .unwrap_or_else(|| self.highlighter.syntax_set.find_syntax_plain_text());
-            let mut hl_state = self.highlighter.new_highlight_state(syntax_ref);
-
-            for diff_line in &diff.lines {
-                match diff_line {
-                    UnifiedDiffLine::HunkHeader(_) => {
-                        // No syntax highlighting for hunk headers
-                        self.diff_highlighted_lines.push(Vec::new());
-                    }
-                    UnifiedDiffLine::Context(s)
-                    | UnifiedDiffLine::Added(s)
-                    | UnifiedDiffLine::Removed(s) => {
-                        let spans = self.highlighter.highlight_line(
-                            &mut hl_state,
-                            &format!("{s}\n"),
-                        );
-                        self.diff_highlighted_lines.push(spans);
-                    }
+                UnifiedDiffLine::Context(s)
+                | UnifiedDiffLine::Added(s)
+                | UnifiedDiffLine::Removed(s) => {
+                    let spans = self.highlighter.highlight_line(
+                        &mut hl_state,
+                        &format!("{s}\n"),
+                    );
+                    self.diff_highlighted_lines.push(spans);
                 }
             }
         }
+    }
 
-        self.unified_diff = unified_diff;
+    /// Incrementally compute syntax highlighting up to (exclusive) the given line index.
+    ///
+    /// Syntect is stateful — each line's highlighting depends on all preceding
+    /// lines. We cache the `ParseState` and `HighlightState` after the last
+    /// highlighted line so that subsequent calls resume in O(new_lines) rather
+    /// than replaying from line 0.
+    fn ensure_highlighted_up_to(&mut self, up_to: usize) {
+        let (lines, syntax_name) = match &self.content {
+            ViewerContent::File {
+                lines, syntax_name, ..
+            } => (lines, syntax_name.clone()),
+            _ => return,
+        };
+
+        let already = self.highlighted_lines.len();
+        let target = up_to.min(lines.len());
+        if already >= target {
+            return;
+        }
+
+        let syntax_ref = self
+            .highlighter
+            .syntax_set
+            .find_syntax_by_name(&syntax_name)
+            .unwrap_or_else(|| self.highlighter.syntax_set.find_syntax_plain_text());
+
+        // Restore saved state or create fresh state for the first call.
+        let mut hl_lines = match (self.hl_highlight_state.take(), self.hl_parse_state.take()) {
+            (Some(hs), Some(ps)) => {
+                syntect::easy::HighlightLines::from_state(&self.highlighter.theme, hs, ps)
+            }
+            _ => self.highlighter.new_highlight_state(syntax_ref),
+        };
+
+        // Highlight only the new lines.
+        self.highlighted_lines.reserve(target - already);
+        for line in &lines[already..target] {
+            let spans = self
+                .highlighter
+                .highlight_line(&mut hl_lines, &format!("{line}\n"));
+            self.highlighted_lines.push(spans);
+        }
+
+        // Save state for the next incremental call via `state(self)`.
+        let (hs, ps) = hl_lines.state();
+        self.hl_highlight_state = Some(hs);
+        self.hl_parse_state = Some(ps);
     }
 
     /// Load a file into the viewer.
@@ -144,6 +233,8 @@ impl FileViewer {
         self.line_diff = None;
         self.unified_diff = None;
         self.highlighted_lines.clear();
+        self.hl_parse_state = None;
+        self.hl_highlight_state = None;
         self.diff_highlighted_lines.clear();
 
         // Try to read the file
@@ -184,14 +275,8 @@ impl FileViewer {
         let syntax = self.highlighter.detect_syntax(path, first_line);
         let syntax_name = syntax.name.clone();
 
-        // Pre-compute highlighted spans for all lines so rendering is O(visible_lines)
-        // instead of O(scroll_offset) on every frame.
-        let mut hl_state = self.highlighter.new_highlight_state(syntax);
-        self.highlighted_lines.reserve(lines.len());
-        for line in &lines {
-            let spans = self.highlighter.highlight_line(&mut hl_state, &format!("{line}\n"));
-            self.highlighted_lines.push(spans);
-        }
+        // Highlighting is deferred: `ensure_highlighted_up_to` computes spans
+        // incrementally during render, keeping file selection snappy.
 
         self.content = ViewerContent::File {
             path: path.to_path_buf(),
@@ -215,6 +300,103 @@ impl FileViewer {
     /// Find comment that ends at a given file line (1-indexed).
     fn comment_at_end_line(&self, line: usize) -> Option<&Comment> {
         self.comments.iter().find(|c| c.end_line == line)
+    }
+
+    /// Compute minimap markers for each row of the minimap.
+    /// Returns a Vec of length `minimap_height` where each entry is the most
+    /// important marker for lines mapped to that row (Comment > Diff).
+    fn compute_minimap_markers(&self, minimap_height: usize) -> Vec<Option<MinimapMarker>> {
+        let total = self.total_lines();
+        if total == 0 || minimap_height == 0 {
+            return vec![None; minimap_height];
+        }
+
+        let mut markers = vec![None; minimap_height];
+
+        if self.diff_mode {
+            // Diff mode: use unified diff lines (excluding hunk headers)
+            if let Some(ref diff) = self.unified_diff {
+                let displayable: Vec<&UnifiedDiffLine> = diff
+                    .lines
+                    .iter()
+                    .filter(|l| !matches!(l, UnifiedDiffLine::HunkHeader(_)))
+                    .collect();
+                for (i, line) in displayable.iter().enumerate() {
+                    let row = i * minimap_height / total.max(1);
+                    if row >= minimap_height {
+                        break;
+                    }
+                    let marker = match line {
+                        UnifiedDiffLine::Added(_) => Some(MinimapMarker::Added),
+                        UnifiedDiffLine::Removed(_) => Some(MinimapMarker::Removed),
+                        _ => None,
+                    };
+                    if let Some(m) = marker {
+                        // Diff markers only set if no comment marker already present
+                        if markers[row] != Some(MinimapMarker::Comment) {
+                            markers[row] = Some(m);
+                        }
+                    }
+                }
+            }
+        } else {
+            // Normal mode: use line diff data
+            if let Some(ref ld) = self.line_diff {
+                for line_num in 1..=total {
+                    let row = (line_num - 1) * minimap_height / total;
+                    if row >= minimap_height {
+                        break;
+                    }
+                    let kind = ld.line_kind(line_num);
+                    let marker = match kind {
+                        DiffLineKind::Added => Some(MinimapMarker::Added),
+                        DiffLineKind::Modified => Some(MinimapMarker::Modified),
+                        DiffLineKind::Unchanged => None,
+                    };
+                    if let Some(m) = marker {
+                        if markers[row] != Some(MinimapMarker::Comment) {
+                            markers[row] = Some(m);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Comment markers (highest priority, overwrite diff markers)
+        for comment in &self.comments {
+            for line_num in comment.start_line..=comment.end_line {
+                let idx = if self.diff_mode {
+                    // In diff mode, approximate position
+                    line_num.saturating_sub(1)
+                } else {
+                    line_num.saturating_sub(1)
+                };
+                let row = idx * minimap_height / total.max(1);
+                if row < minimap_height {
+                    markers[row] = Some(MinimapMarker::Comment);
+                }
+            }
+        }
+
+        markers
+    }
+
+    /// Translate a minimap row to the corresponding file line index (0-based).
+    fn minimap_row_to_line(&self, row: u16, minimap_height: u16) -> usize {
+        let total = self.total_lines();
+        if minimap_height == 0 || total == 0 {
+            return 0;
+        }
+        (row as usize * total / minimap_height as usize).min(total.saturating_sub(1))
+    }
+
+    /// Scroll so that the line corresponding to a minimap row is centered in the viewport.
+    pub fn scroll_to_minimap_row(&mut self, row: u16, minimap_height: u16) {
+        let line = self.minimap_row_to_line(row, minimap_height);
+        let half = self.visible_height / 2;
+        self.scroll_offset = line.saturating_sub(half);
+        self.scroll_offset = self.scroll_offset.min(self.max_scroll());
+        self.cursor_line = line;
     }
 
     fn max_scroll(&self) -> usize {
@@ -268,46 +450,77 @@ impl FileViewer {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        self.visible_height = inner.height as usize;
+        // Decide whether to show minimap: only for File content with sufficient width
+        let show_minimap = matches!(self.content, ViewerContent::File { .. })
+            && inner.width >= MINIMAP_MIN_WIDTH;
+
+        let (content_area, minimap_area) = if show_minimap {
+            let content_w = inner.width.saturating_sub(MINIMAP_WIDTH);
+            let content = Rect::new(inner.x, inner.y, content_w, inner.height);
+            let minimap = Rect::new(inner.x + content_w, inner.y, MINIMAP_WIDTH, inner.height);
+            (content, Some(minimap))
+        } else {
+            (inner, None)
+        };
+        self.minimap_rect = minimap_area;
+
+        self.visible_height = content_area.height as usize;
 
         // Diff mode rendering
         if self.diff_mode {
-            self.render_diff_mode(inner, buf);
+            self.render_diff_mode(content_area, buf);
+            if let Some(mr) = minimap_area {
+                self.render_minimap(mr, buf);
+            }
             return;
         }
 
         match &self.content {
             ViewerContent::Placeholder => {
+                self.minimap_rect = None;
                 let msg = "Select a file to preview";
                 let line = Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray)));
                 buf.set_line(inner.x, inner.y, &line, inner.width);
             }
             ViewerContent::Binary(_) => {
+                self.minimap_rect = None;
                 let msg = "Binary file — cannot display";
                 let line = Line::from(Span::styled(msg, Style::default().fg(Color::Yellow)));
                 buf.set_line(inner.x, inner.y, &line, inner.width);
             }
             ViewerContent::Empty(_) => {
+                self.minimap_rect = None;
                 let msg = "Empty file";
                 let line = Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray)));
                 buf.set_line(inner.x, inner.y, &line, inner.width);
             }
             ViewerContent::Error(msg) => {
+                self.minimap_rect = None;
                 let line = Line::from(Span::styled(msg.as_str(), Style::default().fg(Color::Red)));
                 buf.set_line(inner.x, inner.y, &line, inner.width);
             }
-            ViewerContent::File {
-                lines,
-                ..
-            } => {
+            ViewerContent::File { .. } => {
+                // Extract line count to call ensure_highlighted_up_to outside the borrow.
+                let line_count = match &self.content {
+                    ViewerContent::File { lines, .. } => lines.len(),
+                    _ => 0,
+                };
+                // Incrementally compute highlights up to the last visible line.
+                let need_up_to = (self.scroll_offset + content_area.height as usize).min(line_count);
+                self.ensure_highlighted_up_to(need_up_to);
+
+                let lines = match &self.content {
+                    ViewerContent::File { lines, .. } => lines,
+                    _ => unreachable!(),
+                };
                 let gutter_width = line_number_width(lines.len());
                 let has_diff = self.line_diff.is_some();
                 // gutter = diff marker (1 if present) + line number digits + 1 space
                 let gutter_cols = gutter_width + 1 + if has_diff { 1 } else { 0 };
-                self.visible_content_width = (inner.width as usize).saturating_sub(gutter_cols);
+                self.visible_content_width = (content_area.width as usize).saturating_sub(gutter_cols);
 
                 let mut render_row: u16 = 0;
-                let max_rows = inner.height;
+                let max_rows = content_area.height;
 
                 for code_line_idx in self.scroll_offset..lines.len() {
                     if render_row >= max_rows {
@@ -353,12 +566,12 @@ impl FileViewer {
 
                     let line = Line::from(spans);
 
-                    let y = inner.y + render_row;
-                    buf.set_line(inner.x, y, &line, inner.width);
+                    let y = content_area.y + render_row;
+                    buf.set_line(content_area.x, y, &line, content_area.width);
 
                     // Highlight cursor line with subtle background
                     if focused && code_line_idx == self.cursor_line {
-                        for x in inner.x..inner.x + inner.width {
+                        for x in content_area.x..content_area.x + content_area.width {
                             let cell = &mut buf[(x, y)];
                             cell.set_bg(Color::DarkGray);
                         }
@@ -370,10 +583,15 @@ impl FileViewer {
                     if let Some(comment) = self.comment_at_end_line(line_num) {
                         if render_row < max_rows {
                             self.render_comment_block(
-                                comment, inner, buf, &mut render_row, max_rows,
+                                comment, content_area, buf, &mut render_row, max_rows,
                             );
                         }
                     }
+                }
+
+                // Render minimap after content
+                if let Some(mr) = minimap_area {
+                    self.render_minimap(mr, buf);
                 }
             }
         }
@@ -420,8 +638,95 @@ impl FileViewer {
         }
     }
 
+    /// Render the minimap with half-block characters for 2x vertical resolution.
+    ///
+    /// Column 1 (left): change markers — colored half-blocks showing where diffs/comments are.
+    /// Column 2 (right): viewport indicator — shows which portion of the file is visible.
+    ///
+    /// Half-block rendering doubles the effective vertical resolution by using ▀ (upper half)
+    /// and ▄ (lower half) characters, where each terminal row encodes two virtual rows.
+    fn render_minimap(&self, area: Rect, buf: &mut Buffer) {
+        let minimap_h = area.height as usize;
+        let total = self.total_lines();
+
+        // 2x virtual resolution: each terminal row maps to 2 virtual rows
+        let virtual_h = minimap_h * 2;
+        let markers = self.compute_minimap_markers(virtual_h);
+
+        // Viewport range in virtual rows (ceiling division for end)
+        let (vp_start, vp_end) = if total > 0 {
+            let start = self.scroll_offset * virtual_h / total;
+            let visible = self.visible_height.min(total);
+            let end_numer = (self.scroll_offset + visible) * virtual_h;
+            let end = ((end_numer + total - 1) / total).min(virtual_h);
+            (start, end.max(start + 1))
+        } else {
+            (0, virtual_h)
+        };
+
+        let bg_dim = Color::Rgb(30, 30, 30);
+        let vp_color = Color::Rgb(80, 80, 80);
+
+        fn marker_color(m: MinimapMarker) -> Color {
+            match m {
+                MinimapMarker::Added => Color::Green,
+                MinimapMarker::Modified => Color::Yellow,
+                MinimapMarker::Removed => Color::Red,
+                MinimapMarker::Comment => Color::Cyan,
+            }
+        }
+
+        for row in 0..minimap_h {
+            let y = area.y + row as u16;
+            let vr_top = row * 2;
+            let vr_bot = row * 2 + 1;
+
+            // Column 1: change markers (half-block, 2x resolution)
+            let top_m = markers.get(vr_top).copied().flatten();
+            let bot_m = if vr_bot < virtual_h {
+                markers.get(vr_bot).copied().flatten()
+            } else {
+                None
+            };
+
+            let (ch1, fg1, bg1) = match (top_m, bot_m) {
+                (Some(t), Some(b)) => {
+                    let tc = marker_color(t);
+                    let bc = marker_color(b);
+                    if tc == bc {
+                        ("█", tc, bg_dim)
+                    } else {
+                        // ▀: fg = top pixel, bg = bottom pixel
+                        ("▀", tc, bc)
+                    }
+                }
+                (Some(t), None) => ("▀", marker_color(t), bg_dim),
+                (None, Some(b)) => ("▄", marker_color(b), bg_dim),
+                (None, None) => (" ", bg_dim, bg_dim),
+            };
+            let line1 = Line::from(Span::styled(ch1, Style::default().fg(fg1).bg(bg1)));
+            buf.set_line(area.x, y, &line1, 1);
+
+            // Column 2: viewport indicator (half-block, 2x resolution)
+            if area.width > 1 {
+                let top_vp = vr_top >= vp_start && vr_top < vp_end;
+                let bot_vp = vr_bot >= vp_start && vr_bot < vp_end;
+
+                let (ch2, fg2, bg2) = match (top_vp, bot_vp) {
+                    (true, true) => ("█", vp_color, bg_dim),
+                    (true, false) => ("▀", vp_color, bg_dim),
+                    (false, true) => ("▄", vp_color, bg_dim),
+                    (false, false) => (" ", bg_dim, bg_dim),
+                };
+                let line2 = Line::from(Span::styled(ch2, Style::default().fg(fg2).bg(bg2)));
+                buf.set_line(area.x + 1, y, &line2, 1);
+            }
+        }
+    }
+
     /// Render unified diff content with language syntax highlighting.
-    fn render_diff_mode(&self, inner: Rect, buf: &mut Buffer) {
+    fn render_diff_mode(&mut self, inner: Rect, buf: &mut Buffer) {
+        self.ensure_diff_highlighted();
         let Some(ref diff) = self.unified_diff else {
             let msg = "No changes";
             let line = Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray)));
@@ -1074,9 +1379,9 @@ mod tests {
         }
     }
 
-    // Diff mode syntax highlighting
+    // Diff mode syntax highlighting (lazy: computed on first ensure_diff_highlighted call)
     #[test]
-    fn diff_highlighted_lines_populated_on_set_diff() {
+    fn diff_highlighted_lines_populated_on_ensure() {
         let (_tmp, path) = tmp_file("test.rs", b"fn main() {\n    println!(\"hi\");\n}\n");
         let mut viewer = FileViewer::new();
         viewer.load_file(&path);
@@ -1092,7 +1397,12 @@ mod tests {
         };
         viewer.set_diff(None, Some(diff));
 
-        // Should have pre-computed highlighted spans for each diff line
+        // Highlights should NOT be computed eagerly
+        assert!(viewer.diff_highlighted_lines.is_empty());
+
+        // Trigger lazy computation
+        viewer.ensure_diff_highlighted();
+
         assert_eq!(viewer.diff_highlighted_lines.len(), 5);
 
         // Hunk header should have no syntax highlighting (empty spans)
@@ -1101,7 +1411,6 @@ mod tests {
         // Code lines should have syntax-highlighted spans with RGB colors
         let code_spans = &viewer.diff_highlighted_lines[1]; // "fn main() {"
         assert!(!code_spans.is_empty());
-        // At least one span should have RGB color from syntect
         assert!(
             code_spans.iter().any(|s| matches!(s.style.fg, Some(Color::Rgb(_, _, _)))),
             "Code spans should have RGB colors from syntax highlighting"
@@ -1291,6 +1600,7 @@ mod tests {
             lines: vec![UnifiedDiffLine::Context("fn main() {}".to_string())],
         };
         viewer.set_diff(None, Some(diff));
+        viewer.ensure_diff_highlighted();
         assert!(!viewer.diff_highlighted_lines.is_empty());
 
         // Reload a file — diff highlights should be cleared
@@ -1449,4 +1759,5 @@ mod tests {
         viewer.handle_event(key(KeyCode::Right)).unwrap();
         assert_eq!(viewer.h_scroll, H_SCROLL_AMOUNT);
     }
+
 }

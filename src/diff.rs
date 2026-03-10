@@ -47,95 +47,50 @@ pub struct UnifiedDiff {
     pub lines: Vec<UnifiedDiffLine>,
 }
 
-/// Compute per-line diff information for a file (working tree vs HEAD).
+/// Compute both line diff and unified diff for a file in a single pass.
 ///
-/// Returns `None` if the path is not inside a git repository or an error occurs.
-pub fn compute_line_diff(repo_path: &Path, file_path: &Path) -> Option<LineDiff> {
+/// Opens the repository once, reads the file once, and computes both diffs
+/// from a single Patch computation. Returns `None` if the path is not inside
+/// a git repository or an error occurs.
+pub fn compute_diffs(
+    repo_path: &Path,
+    file_path: &Path,
+) -> Option<(LineDiff, UnifiedDiff)> {
     let repo = git2::Repository::discover(repo_path).ok()?;
     let workdir = repo.workdir()?.canonicalize().ok()?;
 
     let rel_path = file_path.canonicalize().ok()?;
     let rel_path = rel_path.strip_prefix(&workdir).ok()?;
 
-    // Read working tree file content
     let working_content = std::fs::read_to_string(file_path).ok()?;
     let working_lines: Vec<&str> = working_content.lines().collect();
 
-    // Try to get HEAD blob content
     let head_content = get_head_blob_content(&repo, rel_path);
 
     let old_content = match head_content {
-        Some(ref c) => c.as_str(),
+        Some(ref c) => c.clone(),
         None => {
             // Untracked or new file: all lines are Added
-            let lines = vec![DiffLineKind::Added; working_lines.len()];
-            return Some(LineDiff { lines });
+            let line_diff = LineDiff {
+                lines: vec![DiffLineKind::Added; working_lines.len()],
+            };
+            // Build unified diff with all lines as Added
+            let mut unified_lines = Vec::new();
+            if !working_lines.is_empty() {
+                unified_lines.push(UnifiedDiffLine::HunkHeader(format!(
+                    "@@ -0,0 +1,{} @@",
+                    working_lines.len()
+                )));
+                for wl in &working_lines {
+                    unified_lines.push(UnifiedDiffLine::Added(wl.to_string()));
+                }
+            }
+            return Some((line_diff, UnifiedDiff { lines: unified_lines }));
         }
     };
 
-    // Use git2::Patch to compute line-level diff
-    let mut result = vec![DiffLineKind::Unchanged; working_lines.len()];
-    let patch = git2::Patch::from_buffers(
-        old_content.as_bytes(),
-        None,
-        working_content.as_bytes(),
-        None,
-        None,
-    )
-    .ok()?;
-
-    let num_hunks = patch.num_hunks();
-    for hunk_idx in 0..num_hunks {
-        let (_, num_lines) = patch.hunk(hunk_idx).ok()?;
-        let mut removals_in_hunk = 0u32;
-        let mut additions_in_hunk: Vec<u32> = Vec::new();
-
-        for line_idx in 0..num_lines {
-            let line = patch.line_in_hunk(hunk_idx, line_idx).ok()?;
-            match line.origin() {
-                '+' => {
-                    if let Some(lineno) = line.new_lineno() {
-                        additions_in_hunk.push(lineno);
-                    }
-                }
-                '-' => {
-                    removals_in_hunk += 1;
-                }
-                _ => {}
-            }
-        }
-
-        // Lines that replace removed lines are Modified; rest are Added
-        let modified_count = (removals_in_hunk as usize).min(additions_in_hunk.len());
-        for (i, &lineno) in additions_in_hunk.iter().enumerate() {
-            let idx = lineno as usize - 1;
-            if idx < result.len() {
-                result[idx] = if i < modified_count {
-                    DiffLineKind::Modified
-                } else {
-                    DiffLineKind::Added
-                };
-            }
-        }
-    }
-
-    Some(LineDiff { lines: result })
-}
-
-/// Compute unified diff for a file (working tree vs HEAD).
-///
-/// Returns `None` if not inside a git repository or an error occurs.
-pub fn compute_unified_diff(repo_path: &Path, file_path: &Path) -> Option<UnifiedDiff> {
-    let repo = git2::Repository::discover(repo_path).ok()?;
-    let workdir = repo.workdir()?.canonicalize().ok()?;
-
-    let rel_path = file_path.canonicalize().ok()?;
-    let rel_path = rel_path.strip_prefix(&workdir).ok()?;
-
-    let working_content = std::fs::read_to_string(file_path).ok()?;
-    let head_content = get_head_blob_content(&repo, rel_path);
-    let old_content = head_content.unwrap_or_default();
-
+    // Compute a single patch with full context (for unified diff).
+    // We extract both line-level kinds and unified diff lines from this one patch.
     let mut opts = git2::DiffOptions::new();
     opts.context_lines(u32::MAX);
 
@@ -148,29 +103,78 @@ pub fn compute_unified_diff(repo_path: &Path, file_path: &Path) -> Option<Unifie
     )
     .ok()?;
 
-    let mut lines = Vec::new();
+    // Build both results in a single pass over the hunks
+    let mut line_kinds = vec![DiffLineKind::Unchanged; working_lines.len()];
+    let mut unified_lines = Vec::new();
     let num_hunks = patch.num_hunks();
 
     for hunk_idx in 0..num_hunks {
         let (hunk, num_lines) = patch.hunk(hunk_idx).ok()?;
+
+        // Unified diff: hunk header
         let header = String::from_utf8_lossy(hunk.header()).trim().to_string();
-        lines.push(UnifiedDiffLine::HunkHeader(header));
+        unified_lines.push(UnifiedDiffLine::HunkHeader(header));
+
+        // Collect additions/removals per hunk for line diff classification
+        let mut removals_in_hunk = 0u32;
+        let mut additions_in_hunk: Vec<u32> = Vec::new();
 
         for line_idx in 0..num_lines {
             let line = patch.line_in_hunk(hunk_idx, line_idx).ok()?;
             let content = String::from_utf8_lossy(line.content())
                 .trim_end_matches('\n')
                 .to_string();
+
             match line.origin() {
-                '+' => lines.push(UnifiedDiffLine::Added(content)),
-                '-' => lines.push(UnifiedDiffLine::Removed(content)),
-                ' ' => lines.push(UnifiedDiffLine::Context(content)),
+                '+' => {
+                    unified_lines.push(UnifiedDiffLine::Added(content));
+                    if let Some(lineno) = line.new_lineno() {
+                        additions_in_hunk.push(lineno);
+                    }
+                }
+                '-' => {
+                    unified_lines.push(UnifiedDiffLine::Removed(content));
+                    removals_in_hunk += 1;
+                }
+                ' ' => {
+                    unified_lines.push(UnifiedDiffLine::Context(content));
+                }
                 _ => {}
+            }
+        }
+
+        // Classify additions: those replacing removals are Modified, rest are Added
+        let modified_count = (removals_in_hunk as usize).min(additions_in_hunk.len());
+        for (i, &lineno) in additions_in_hunk.iter().enumerate() {
+            let idx = lineno as usize - 1;
+            if idx < line_kinds.len() {
+                line_kinds[idx] = if i < modified_count {
+                    DiffLineKind::Modified
+                } else {
+                    DiffLineKind::Added
+                };
             }
         }
     }
 
-    Some(UnifiedDiff { lines })
+    Some((
+        LineDiff { lines: line_kinds },
+        UnifiedDiff { lines: unified_lines },
+    ))
+}
+
+/// Compute per-line diff information for a file (working tree vs HEAD).
+///
+/// Returns `None` if the path is not inside a git repository or an error occurs.
+pub fn compute_line_diff(repo_path: &Path, file_path: &Path) -> Option<LineDiff> {
+    compute_diffs(repo_path, file_path).map(|(ld, _)| ld)
+}
+
+/// Compute unified diff for a file (working tree vs HEAD).
+///
+/// Returns `None` if not inside a git repository or an error occurs.
+pub fn compute_unified_diff(repo_path: &Path, file_path: &Path) -> Option<UnifiedDiff> {
+    compute_diffs(repo_path, file_path).map(|(_, ud)| ud)
 }
 
 /// Get the content of a file at HEAD.

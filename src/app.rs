@@ -247,9 +247,11 @@ impl App {
 
     fn load_diff_for_file(&mut self, path: &std::path::Path) {
         if let Some(ref workdir) = self.git_workdir {
-            let line_diff = diff::compute_line_diff(workdir, path);
-            let unified_diff = diff::compute_unified_diff(workdir, path);
-            self.file_viewer.set_diff(line_diff, unified_diff);
+            if let Some((line_diff, unified_diff)) = diff::compute_diffs(workdir, path) {
+                self.file_viewer.set_diff(Some(line_diff), Some(unified_diff));
+            } else {
+                self.file_viewer.set_diff(None, None);
+            }
         }
     }
 }
@@ -495,6 +497,20 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent, terminal_wid
                             }
                         }
                     }
+                }
+            } else if let Some(mr) = app.file_viewer.minimap_rect {
+                if mouse.column >= mr.x
+                    && mouse.column < mr.x + mr.width
+                    && mouse.row >= mr.y
+                    && mouse.row < mr.y + mr.height
+                {
+                    // Click on minimap: scroll to corresponding file position
+                    app.focus = Focus::Viewer;
+                    let row_in_minimap = mouse.row - mr.y;
+                    app.file_viewer
+                        .scroll_to_minimap_row(row_in_minimap, mr.height);
+                } else {
+                    app.focus = Focus::Viewer;
                 }
             } else {
                 app.focus = Focus::Viewer;
