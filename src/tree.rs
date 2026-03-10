@@ -1,4 +1,8 @@
+use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+
+use crate::git_status::{FileStatus, GitStatus};
 
 /// A single entry in the file tree (file or directory).
 #[derive(Debug, Clone, PartialEq)]
@@ -7,6 +11,8 @@ pub struct TreeEntry {
     pub depth: usize,
     pub is_directory: bool,
     pub is_expanded: bool,
+    /// Git status for this file (None if clean or not in a git repo).
+    pub git_status: Option<FileStatus>,
 }
 
 impl TreeEntry {
@@ -16,6 +22,7 @@ impl TreeEntry {
             depth,
             is_directory: false,
             is_expanded: false,
+            git_status: None,
         }
     }
 
@@ -25,6 +32,7 @@ impl TreeEntry {
             depth,
             is_directory: true,
             is_expanded: false,
+            git_status: None,
         }
     }
 
@@ -87,17 +95,29 @@ pub struct FileTreeModel {
     pub selected: usize,
     /// Root directory being displayed.
     root: PathBuf,
+    /// Git status for the repository (None if not inside a git repo).
+    git_status: Option<GitStatus>,
+    /// Whether the changed-files-only filter is active.
+    pub filter_changed: bool,
 }
 
 impl FileTreeModel {
     /// Build a new tree model from a root directory. The root is expanded by default.
-    pub fn from_dir(root: &Path) -> anyhow::Result<Self> {
+    pub fn from_dir(root: &Path, git_status: Option<GitStatus>) -> anyhow::Result<Self> {
         let mut entries = scan_dir(root, 0)?;
+        if let Some(ref gs) = git_status {
+            inject_deleted_files(&mut entries, gs, root, 0);
+        }
         sort_entries(&mut entries);
+        if let Some(ref gs) = git_status {
+            annotate_entries(&mut entries, gs);
+        }
         Ok(Self {
             entries,
             selected: 0,
             root: root.to_path_buf(),
+            git_status,
+            filter_changed: false,
         })
     }
 
@@ -127,7 +147,18 @@ impl FileTreeModel {
             let path = entry.path.clone();
             let child_depth = entry.depth + 1;
             let mut children = scan_dir(&path, child_depth)?;
+
+            if let Some(ref gs) = self.git_status {
+                inject_deleted_files(&mut children, gs, &path, child_depth);
+            }
             sort_entries(&mut children);
+
+            if let Some(ref gs) = self.git_status {
+                annotate_entries(&mut children, gs);
+                if self.filter_changed {
+                    filter_changed_entries(&mut children, gs);
+                }
+            }
 
             self.entries[self.selected].is_expanded = true;
             let insert_pos = self.selected + 1;
@@ -142,6 +173,238 @@ impl FileTreeModel {
     /// Return the currently selected entry, if any.
     pub fn selected_entry(&self) -> Option<&TreeEntry> {
         self.entries.get(self.selected)
+    }
+
+    /// Get a reference to the git status data.
+    pub fn git_status_ref(&self) -> Option<&GitStatus> {
+        self.git_status.as_ref()
+    }
+
+    /// Check if a directory has git changes among its descendants.
+    pub fn dir_has_changes(&self, path: &Path) -> bool {
+        self.git_status
+            .as_ref()
+            .is_some_and(|gs| gs.dir_has_changes(path))
+    }
+
+    /// Rescan the file tree from disk, preserving expanded directories and selection.
+    /// Also refreshes git status.
+    pub fn refresh_tree(&mut self) -> anyhow::Result<()> {
+        // Remember which directories are expanded
+        let expanded: std::collections::HashSet<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|e| e.is_directory && e.is_expanded)
+            .map(|e| e.path.clone())
+            .collect();
+
+        // Remember current selection path
+        let selected_path = self.entries.get(self.selected).map(|e| e.path.clone());
+
+        // Refresh git status
+        self.git_status = GitStatus::from_dir(&self.root);
+
+        // Rescan root
+        let mut entries = scan_dir(&self.root, 0)?;
+        if let Some(ref gs) = self.git_status {
+            inject_deleted_files(&mut entries, gs, &self.root, 0);
+        }
+        sort_entries(&mut entries);
+        if let Some(ref gs) = self.git_status {
+            annotate_entries(&mut entries, gs);
+            if self.filter_changed {
+                filter_changed_entries(&mut entries, gs);
+            }
+        }
+
+        // Re-expand previously expanded directories (depth-first)
+        let mut i = 0;
+        while i < entries.len() {
+            if entries[i].is_directory && expanded.contains(&entries[i].path) {
+                let path = entries[i].path.clone();
+                let child_depth = entries[i].depth + 1;
+                let mut children = scan_dir(&path, child_depth)?;
+                if let Some(ref gs) = self.git_status {
+                    inject_deleted_files(&mut children, gs, &path, child_depth);
+                }
+                sort_entries(&mut children);
+                if let Some(ref gs) = self.git_status {
+                    annotate_entries(&mut children, gs);
+                    if self.filter_changed {
+                        filter_changed_entries(&mut children, gs);
+                    }
+                }
+                entries[i].is_expanded = true;
+                let insert_pos = i + 1;
+                for (j, child) in children.into_iter().enumerate() {
+                    entries.insert(insert_pos + j, child);
+                }
+            }
+            i += 1;
+        }
+
+        self.entries = entries;
+
+        // Restore selection
+        self.selected = selected_path
+            .and_then(|p| self.entries.iter().position(|e| e.path == p))
+            .unwrap_or(self.selected.min(self.entries.len().saturating_sub(1)));
+
+        Ok(())
+    }
+
+    /// Toggle the changed-files-only filter. No-op if not inside a git repo.
+    pub fn toggle_filter(&mut self) -> anyhow::Result<()> {
+        if self.git_status.is_none() {
+            return Ok(());
+        }
+
+        self.filter_changed = !self.filter_changed;
+
+        // Save current selection path for restoration
+        let selected_path = self.entries.get(self.selected).map(|e| e.path.clone());
+
+        // Rebuild root-level entries
+        let mut entries = scan_dir(&self.root, 0)?;
+        if let Some(ref gs) = self.git_status {
+            inject_deleted_files(&mut entries, gs, &self.root, 0);
+        }
+        sort_entries(&mut entries);
+        if let Some(ref gs) = self.git_status {
+            annotate_entries(&mut entries, gs);
+            if self.filter_changed {
+                filter_changed_entries(&mut entries, gs);
+            }
+        }
+        self.entries = entries;
+
+        // Restore selection or reset to first entry
+        self.selected = selected_path
+            .and_then(|p| self.entries.iter().position(|e| e.path == p))
+            .unwrap_or(0);
+
+        Ok(())
+    }
+}
+
+/// Search for files matching the query (case-insensitive, file name only).
+/// Returns tree entries with matching files and their ancestor directories (all expanded).
+pub fn search_files(root: &Path, query: &str) -> anyhow::Result<Vec<TreeEntry>> {
+    use ignore::WalkBuilder;
+
+    let query_lower = query.to_lowercase();
+
+    // First pass: walk to find matching file paths and their ancestors
+    let walker = WalkBuilder::new(root).hidden(true).build();
+    let mut matching_set: HashSet<PathBuf> = HashSet::new();
+
+    for result in walker {
+        let entry = result?;
+        let path = entry.path().to_path_buf();
+        if path == root {
+            continue;
+        }
+        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if name.to_lowercase().contains(&query_lower) {
+            matching_set.insert(path.clone());
+            // Add ancestor directories
+            let mut parent = path.parent();
+            while let Some(p) = parent {
+                if p == root {
+                    break;
+                }
+                matching_set.insert(p.to_path_buf());
+                parent = p.parent();
+            }
+        }
+    }
+
+    // Second pass: walk in sorted order, keeping only matching entries
+    let walker = WalkBuilder::new(root)
+        .hidden(true)
+        .sort_by_file_name(|a: &OsStr, b: &OsStr| {
+            let a_lower = a.to_ascii_lowercase();
+            let b_lower = b.to_ascii_lowercase();
+            a_lower.cmp(&b_lower)
+        })
+        .build();
+
+    let mut entries = Vec::new();
+    for result in walker {
+        let entry = result?;
+        let path = entry.path().to_path_buf();
+        if path == root {
+            continue;
+        }
+        if !matching_set.contains(&path) {
+            continue;
+        }
+
+        let depth = path
+            .strip_prefix(root)
+            .map(|rel| rel.components().count() - 1)
+            .unwrap_or(0);
+
+        let is_dir = entry.file_type().map_or(false, |ft| ft.is_dir());
+        if is_dir {
+            let mut e = TreeEntry::directory(path, depth);
+            e.is_expanded = true;
+            entries.push(e);
+        } else {
+            entries.push(TreeEntry::file(path, depth));
+        }
+    }
+
+    Ok(entries)
+}
+
+/// Filter entries to only include files with git changes and directories containing changes.
+fn filter_changed_entries(entries: &mut Vec<TreeEntry>, gs: &GitStatus) {
+    entries.retain(|e| {
+        if e.is_directory {
+            gs.dir_has_changes(&e.path)
+        } else {
+            e.git_status.is_some()
+        }
+    });
+}
+
+/// Annotate tree entries with git status information.
+fn annotate_entries(entries: &mut [TreeEntry], gs: &GitStatus) {
+    for entry in entries.iter_mut() {
+        if !entry.is_directory {
+            entry.git_status = gs.file_status(&entry.path);
+        }
+    }
+}
+
+/// Inject deleted files as virtual entries into the tree.
+/// Deleted files exist in git but not on disk, so `scan_dir` cannot find them.
+/// `dir` is the directory being listed, `depth` is the depth of entries in that directory.
+fn inject_deleted_files(entries: &mut Vec<TreeEntry>, gs: &GitStatus, dir: &Path, depth: usize) {
+    let existing: HashSet<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
+
+    for deleted_path in gs.files_with_status(crate::git_status::FileStatus::Deleted) {
+        // Only include files whose parent matches this directory
+        let parent = deleted_path.parent();
+        // dir may not be canonical; compare both canonical and raw
+        let dir_matches = parent == Some(dir)
+            || dir
+                .canonicalize()
+                .ok()
+                .is_some_and(|canon| parent == Some(canon.as_path()));
+
+        if dir_matches && !existing.contains(deleted_path) {
+            let mut entry = TreeEntry::file(deleted_path.to_path_buf(), depth);
+            entry.git_status = Some(crate::git_status::FileStatus::Deleted);
+            entries.push(entry);
+        }
     }
 }
 
@@ -260,7 +523,7 @@ mod tests {
     #[test]
     fn model_from_dir_lists_root_contents_sorted() {
         let tmp = setup_dir(&["b.rs", "a.rs"], &["src"]);
-        let model = FileTreeModel::from_dir(tmp.path()).unwrap();
+        let model = FileTreeModel::from_dir(tmp.path(), None).unwrap();
         let names: Vec<&str> = model.entries.iter().map(|e| e.name()).collect();
         // directories first, then files, alphabetical
         assert_eq!(names, vec!["src", "a.rs", "b.rs"]);
@@ -269,14 +532,14 @@ mod tests {
     #[test]
     fn model_from_dir_selects_first_entry() {
         let tmp = setup_dir(&["file.txt"], &[]);
-        let model = FileTreeModel::from_dir(tmp.path()).unwrap();
+        let model = FileTreeModel::from_dir(tmp.path(), None).unwrap();
         assert_eq!(model.selected, 0);
     }
 
     #[test]
     fn toggle_expand_expands_collapsed_directory() {
         let tmp = setup_dir(&["sub/child.rs"], &["sub"]);
-        let mut model = FileTreeModel::from_dir(tmp.path()).unwrap();
+        let mut model = FileTreeModel::from_dir(tmp.path(), None).unwrap();
         // First entry should be the "sub" directory
         assert!(model.entries[0].is_directory);
         assert!(!model.entries[0].is_expanded);
@@ -293,7 +556,7 @@ mod tests {
     #[test]
     fn toggle_expand_collapses_expanded_directory() {
         let tmp = setup_dir(&["sub/child.rs"], &["sub"]);
-        let mut model = FileTreeModel::from_dir(tmp.path()).unwrap();
+        let mut model = FileTreeModel::from_dir(tmp.path(), None).unwrap();
         model.selected = 0;
         model.toggle_expand().unwrap(); // expand
         let expanded_len = model.entries.len();
@@ -308,7 +571,7 @@ mod tests {
     #[test]
     fn toggle_expand_on_file_is_noop() {
         let tmp = setup_dir(&["file.txt"], &[]);
-        let mut model = FileTreeModel::from_dir(tmp.path()).unwrap();
+        let mut model = FileTreeModel::from_dir(tmp.path(), None).unwrap();
         let len_before = model.entries.len();
         model.selected = 0;
         model.toggle_expand().unwrap();
@@ -318,12 +581,201 @@ mod tests {
     #[test]
     fn toggle_expand_on_empty_directory() {
         let tmp = setup_dir(&[], &["empty"]);
-        let mut model = FileTreeModel::from_dir(tmp.path()).unwrap();
+        let mut model = FileTreeModel::from_dir(tmp.path(), None).unwrap();
         assert_eq!(model.entries[0].name(), "empty");
         model.selected = 0;
         model.toggle_expand().unwrap();
         assert!(model.entries[0].is_expanded);
         // No children added, length stays the same
         assert_eq!(model.entries.len(), 1);
+    }
+
+    /// Helper: create a git repo with initial commit and return (TempDir, canonical root).
+    fn setup_git_repo(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let repo = git2::Repository::init(tmp.path()).unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+
+        for (name, content) in files {
+            let file_path = root.join(name);
+            if let Some(parent) = file_path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&file_path, content).unwrap();
+        }
+
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("test", "test@test.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "initial commit", &tree, &[])
+            .unwrap();
+
+        (tmp, root)
+    }
+
+    #[test]
+    fn refresh_git_status_updates_file_annotations() {
+        let (_tmp, root) = setup_git_repo(&[("file.txt", "hello")]);
+
+        // Initially clean: no git status on file entry
+        let gs = GitStatus::from_dir(&root);
+        let mut model = FileTreeModel::from_dir(&root, gs).unwrap();
+        let file_entry = model.entries.iter().find(|e| e.name() == "file.txt").unwrap();
+        assert_eq!(file_entry.git_status, None, "Clean file should have no status");
+
+        // Modify file externally
+        fs::write(root.join("file.txt"), "modified").unwrap();
+
+        // Refresh tree (includes git status)
+        model.refresh_tree().unwrap();
+
+        // Now file should show Modified
+        let file_entry = model.entries.iter().find(|e| e.name() == "file.txt").unwrap();
+        assert_eq!(
+            file_entry.git_status,
+            Some(FileStatus::Modified),
+            "After refresh, modified file should have Modified status"
+        );
+    }
+
+    #[test]
+    fn refresh_tree_picks_up_new_root_file() {
+        let tmp = setup_dir(&["a.rs"], &[]);
+        let mut model = FileTreeModel::from_dir(tmp.path(), None).unwrap();
+        assert_eq!(model.entries.len(), 1);
+
+        // Create a new file externally
+        fs::write(tmp.path().join("b.rs"), "new").unwrap();
+
+        model.refresh_tree().unwrap();
+
+        let names: Vec<&str> = model.entries.iter().map(|e| e.name()).collect();
+        assert!(names.contains(&"b.rs"), "New file should appear after refresh");
+        assert!(names.contains(&"a.rs"), "Existing file should still be present");
+    }
+
+    #[test]
+    fn refresh_tree_removes_deleted_file() {
+        let tmp = setup_dir(&["a.rs", "b.rs"], &[]);
+        let mut model = FileTreeModel::from_dir(tmp.path(), None).unwrap();
+        assert_eq!(model.entries.len(), 2);
+
+        fs::remove_file(tmp.path().join("b.rs")).unwrap();
+
+        model.refresh_tree().unwrap();
+
+        let names: Vec<&str> = model.entries.iter().map(|e| e.name()).collect();
+        assert!(names.contains(&"a.rs"));
+        assert!(!names.contains(&"b.rs"), "Deleted file should be gone after refresh");
+    }
+
+    #[test]
+    fn refresh_tree_preserves_expanded_directories() {
+        let tmp = setup_dir(&["sub/child.rs", "other.rs"], &["sub"]);
+        let mut model = FileTreeModel::from_dir(tmp.path(), None).unwrap();
+
+        // Expand "sub"
+        model.selected = 0; // sub directory
+        model.toggle_expand().unwrap();
+        assert!(model.entries[0].is_expanded);
+        assert_eq!(model.entries[1].name(), "child.rs");
+
+        // Add a new root file externally
+        fs::write(tmp.path().join("new.rs"), "").unwrap();
+
+        model.refresh_tree().unwrap();
+
+        // "sub" should still be expanded with child visible
+        let sub = model.entries.iter().find(|e| e.name() == "sub").unwrap();
+        assert!(sub.is_expanded, "Expanded directory should stay expanded after refresh");
+        let names: Vec<&str> = model.entries.iter().map(|e| e.name()).collect();
+        assert!(names.contains(&"child.rs"), "Children of expanded dir should be present");
+        assert!(names.contains(&"new.rs"), "New file should appear");
+    }
+
+    #[test]
+    fn refresh_tree_preserves_selection() {
+        let tmp = setup_dir(&["a.rs", "b.rs", "c.rs"], &[]);
+        let mut model = FileTreeModel::from_dir(tmp.path(), None).unwrap();
+
+        // Select b.rs
+        let b_idx = model.entries.iter().position(|e| e.name() == "b.rs").unwrap();
+        model.selected = b_idx;
+
+        // Add a new file
+        fs::write(tmp.path().join("d.rs"), "").unwrap();
+
+        model.refresh_tree().unwrap();
+
+        // Selection should still be on b.rs
+        assert_eq!(
+            model.entries[model.selected].name(),
+            "b.rs",
+            "Selection should be preserved after refresh"
+        );
+    }
+
+    #[test]
+    fn deleted_file_appears_in_tree_with_marker() {
+        let (_tmp, root) = setup_git_repo(&[("file.txt", "hello"), ("keep.txt", "keep")]);
+
+        // Delete a tracked file
+        fs::remove_file(root.join("file.txt")).unwrap();
+
+        let gs = GitStatus::from_dir(&root);
+        let model = FileTreeModel::from_dir(&root, gs).unwrap();
+
+        // Deleted file should appear in tree with [D] status
+        let deleted = model.entries.iter().find(|e| e.name() == "file.txt");
+        assert!(deleted.is_some(), "Deleted tracked file should appear in tree");
+        assert_eq!(
+            deleted.unwrap().git_status,
+            Some(FileStatus::Deleted),
+            "Deleted file should have Deleted status"
+        );
+
+        // Non-deleted file should still be present
+        assert!(model.entries.iter().any(|e| e.name() == "keep.txt"));
+    }
+
+    #[test]
+    fn deleted_file_in_subdirectory_appears_when_expanded() {
+        let (_tmp, root) = setup_git_repo(&[("sub/child.rs", "fn main() {}")]);
+
+        // Delete the tracked file
+        fs::remove_file(root.join("sub/child.rs")).unwrap();
+
+        let gs = GitStatus::from_dir(&root);
+        let mut model = FileTreeModel::from_dir(&root, gs).unwrap();
+
+        // Expand "sub"
+        model.selected = 0;
+        model.toggle_expand().unwrap();
+
+        let deleted = model.entries.iter().find(|e| e.name() == "child.rs");
+        assert!(deleted.is_some(), "Deleted file should appear when parent is expanded");
+        assert_eq!(deleted.unwrap().git_status, Some(FileStatus::Deleted));
+    }
+
+    #[test]
+    fn deleted_file_appears_in_changed_filter() {
+        let (_tmp, root) = setup_git_repo(&[("file.txt", "hello"), ("keep.txt", "keep")]);
+
+        fs::remove_file(root.join("file.txt")).unwrap();
+
+        let gs = GitStatus::from_dir(&root);
+        let mut model = FileTreeModel::from_dir(&root, gs).unwrap();
+
+        model.toggle_filter().unwrap();
+
+        let names: Vec<&str> = model.entries.iter().map(|e| e.name()).collect();
+        assert!(names.contains(&"file.txt"), "Deleted file should appear in changed filter");
+        assert!(!names.contains(&"keep.txt"), "Clean file should not appear in changed filter");
     }
 }

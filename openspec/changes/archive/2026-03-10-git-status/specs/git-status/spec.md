@@ -1,3 +1,5 @@
+## ADDED Requirements
+
 ### Requirement: Git repository detection
 
 The system SHALL detect whether the target directory is inside a git repository on startup. If inside a git repository, the system SHALL compute the working tree status. If outside a git repository, the system SHALL function normally without git features.

@@ -1,9 +1,13 @@
 mod app;
+mod comments;
 mod components;
+mod diff;
 mod file_tree;
 mod file_viewer;
+mod git_status;
 mod highlight;
 mod tree;
+mod watcher;
 
 use std::path::PathBuf;
 

@@ -13,6 +13,14 @@ pub enum Action {
     FileSelected(std::path::PathBuf),
     /// Enter was pressed on a file — switch focus to viewer too.
     FileOpened(std::path::PathBuf),
+    /// User pressed `c` to add/edit a comment on the cursor line.
+    StartComment,
+    /// User pressed `V` to enter line-select mode.
+    StartLineSelect,
+    /// User pressed `e` to export comments.
+    ExportComments,
+    /// User pressed `x` to delete comment on cursor line.
+    DeleteComment,
 }
 
 /// Trait for TUI components.

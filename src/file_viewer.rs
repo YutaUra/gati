@@ -9,7 +9,10 @@ use ratatui::{
     widgets::{Block, Borders, Widget},
 };
 
+use crate::comments::Comment;
 use crate::components::{Action, Component};
+
+use crate::diff::{DiffLineKind, LineDiff, UnifiedDiff, UnifiedDiffLine};
 use crate::highlight::Highlighter;
 
 /// Content to display in the file viewer.
@@ -38,7 +41,17 @@ pub struct FileViewer {
     pub scroll_offset: usize,
     /// Height of the viewer (set during render, used for half-page scroll).
     pub visible_height: usize,
+    /// Cursor line position within the file (0-indexed).
+    pub cursor_line: usize,
     highlighter: Highlighter,
+    /// Per-line diff info for gutter markers in normal mode.
+    pub line_diff: Option<LineDiff>,
+    /// Parsed unified diff for diff mode.
+    pub unified_diff: Option<UnifiedDiff>,
+    /// Whether the viewer is currently in diff mode.
+    pub diff_mode: bool,
+    /// Comments for the currently viewed file (set before each render by App).
+    pub comments: Vec<Comment>,
 }
 
 impl FileViewer {
@@ -47,17 +60,39 @@ impl FileViewer {
             content: ViewerContent::Placeholder,
             scroll_offset: 0,
             visible_height: 20,
+            cursor_line: 0,
             highlighter: Highlighter::new(),
+            line_diff: None,
+            unified_diff: None,
+            diff_mode: false,
+            comments: Vec::new(),
         }
+    }
+
+    /// Set diff data for the currently loaded file.
+    pub fn set_diff(&mut self, line_diff: Option<LineDiff>, unified_diff: Option<UnifiedDiff>) {
+        self.line_diff = line_diff;
+        self.unified_diff = unified_diff;
     }
 
     /// Load a file into the viewer.
     pub fn load_file(&mut self, path: &Path) {
         self.scroll_offset = 0;
+        self.cursor_line = 0;
+        self.diff_mode = false;
+        self.line_diff = None;
+        self.unified_diff = None;
 
         // Try to read the file
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.content = ViewerContent::Error(format!(
+                    "{} — File has been deleted from disk",
+                    path.display(),
+                ));
+                return;
+            }
             Err(e) => {
                 self.content = ViewerContent::Error(format!(
                     "Cannot read {}: {}",
@@ -93,10 +128,18 @@ impl FileViewer {
     }
 
     fn total_lines(&self) -> usize {
+        if self.diff_mode {
+            return self.unified_diff.as_ref().map_or(0, |d| d.lines.len());
+        }
         match &self.content {
             ViewerContent::File { lines, .. } => lines.len(),
             _ => 0,
         }
+    }
+
+    /// Find comment that ends at a given file line (1-indexed).
+    fn comment_at_end_line(&self, line: usize) -> Option<&Comment> {
+        self.comments.iter().find(|c| c.end_line == line)
     }
 
     fn max_scroll(&self) -> usize {
@@ -118,15 +161,23 @@ impl FileViewer {
             Style::default().fg(Color::DarkGray)
         };
 
+        let title = if self.diff_mode { " Diff " } else { " Preview " };
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
-            .title(" Preview ");
+            .title(title);
 
         let inner = block.inner(area);
         block.render(area, buf);
 
         self.visible_height = inner.height as usize;
+
+        // Diff mode rendering
+        if self.diff_mode {
+            self.render_diff_mode(inner, buf);
+            return;
+        }
 
         match &self.content {
             ViewerContent::Placeholder => {
@@ -154,6 +205,7 @@ impl FileViewer {
                 ..
             } => {
                 let gutter_width = line_number_width(lines.len());
+                let has_diff = self.line_diff.is_some();
 
                 // Look up syntax by name and create highlight state
                 let syntax = self
@@ -165,31 +217,186 @@ impl FileViewer {
 
                 // Advance highlight state past lines before scroll_offset
                 for line_text in lines.iter().take(self.scroll_offset) {
-                    // Feed lines to keep parse state correct, discard results
                     let _ = self.highlighter.highlight_line(&mut hl_state, &format!("{line_text}\n"));
                 }
 
-                for (i, line_text) in lines
-                    .iter()
-                    .skip(self.scroll_offset)
-                    .take(self.visible_height)
-                    .enumerate()
-                {
-                    let line_num = self.scroll_offset + i + 1;
-                    let num_str = format!("{:>width$} ", line_num, width = gutter_width);
+                let mut render_row: u16 = 0;
+                let max_rows = inner.height;
 
-                    let mut spans = vec![Span::styled(num_str, Style::default().fg(Color::DarkGray))];
+                for code_line_idx in self.scroll_offset..lines.len() {
+                    if render_row >= max_rows {
+                        break;
+                    }
+
+                    let line_text = &lines[code_line_idx];
+                    let line_num = code_line_idx + 1;
+
+                    let mut spans = Vec::new();
+
+                    // Gutter change marker
+                    if has_diff {
+                        let kind = self
+                            .line_diff
+                            .as_ref()
+                            .map(|d| d.line_kind(line_num))
+                            .unwrap_or(DiffLineKind::Unchanged);
+                        let (marker, color) = match kind {
+                            DiffLineKind::Modified => ("▎", Some(Color::Yellow)),
+                            DiffLineKind::Added => ("▎", Some(Color::Green)),
+                            DiffLineKind::Unchanged => (" ", None),
+                        };
+                        let style = color
+                            .map(|c| Style::default().fg(c))
+                            .unwrap_or_default();
+                        spans.push(Span::styled(marker, style));
+                    }
+
+                    let num_str = format!("{:>width$} ", line_num, width = gutter_width);
+                    spans.push(Span::styled(num_str, Style::default().fg(Color::DarkGray)));
+
                     let highlighted = self.highlighter.highlight_line(&mut hl_state, &format!("{line_text}\n"));
                     spans.extend(highlighted);
 
                     let line = Line::from(spans);
 
-                    let y = inner.y + i as u16;
-                    if y < inner.y + inner.height {
-                        buf.set_line(inner.x, y, &line, inner.width);
+                    let y = inner.y + render_row;
+                    buf.set_line(inner.x, y, &line, inner.width);
+
+                    // Highlight cursor line with subtle background
+                    if focused && code_line_idx == self.cursor_line {
+                        for x in inner.x..inner.x + inner.width {
+                            let cell = &mut buf[(x, y)];
+                            cell.set_bg(Color::DarkGray);
+                        }
+                    }
+
+                    render_row += 1;
+
+                    // Render inline comment block after this line if applicable
+                    if let Some(comment) = self.comment_at_end_line(line_num) {
+                        if render_row < max_rows {
+                            self.render_comment_block(
+                                comment, inner, buf, &mut render_row, max_rows,
+                            );
+                        }
                     }
                 }
             }
+        }
+    }
+
+    /// Render an inline comment block (2 rows: header + text).
+    fn render_comment_block(
+        &self,
+        comment: &Comment,
+        inner: Rect,
+        buf: &mut Buffer,
+        render_row: &mut u16,
+        max_rows: u16,
+    ) {
+        let comment_style = Style::default().fg(Color::Cyan).bg(Color::Black);
+
+        // Row 1: range + comment text
+        let range_str = if comment.start_line == comment.end_line {
+            format!("  💬 L{}: {}", comment.start_line, comment.text)
+        } else {
+            format!(
+                "  💬 L{}-{}: {}",
+                comment.start_line, comment.end_line, comment.text
+            )
+        };
+
+        let y = inner.y + *render_row;
+        let line = Line::from(Span::styled(&range_str, comment_style));
+        buf.set_line(inner.x, y, &line, inner.width);
+        // Fill background for entire row
+        for x in inner.x..inner.x + inner.width {
+            let cell = &mut buf[(x, y)];
+            cell.set_bg(Color::Black);
+        }
+        *render_row += 1;
+
+        // Row 2: separator line
+        if *render_row < max_rows {
+            let y = inner.y + *render_row;
+            let sep = "─".repeat(inner.width as usize);
+            let line = Line::from(Span::styled(sep, Style::default().fg(Color::DarkGray)));
+            buf.set_line(inner.x, y, &line, inner.width);
+            *render_row += 1;
+        }
+    }
+
+    /// Render unified diff content.
+    fn render_diff_mode(&self, inner: Rect, buf: &mut Buffer) {
+        let Some(ref diff) = self.unified_diff else {
+            let msg = "No changes";
+            let line = Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray)));
+            buf.set_line(inner.x, inner.y, &line, inner.width);
+            return;
+        };
+
+        if diff.lines.is_empty() {
+            let msg = "No changes";
+            let line = Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray)));
+            buf.set_line(inner.x, inner.y, &line, inner.width);
+            return;
+        }
+
+        for (i, diff_line) in diff
+            .lines
+            .iter()
+            .skip(self.scroll_offset)
+            .take(self.visible_height)
+            .enumerate()
+        {
+            let (text, style) = match diff_line {
+                UnifiedDiffLine::Added(s) => (format!("+{s}"), Style::default().fg(Color::Green)),
+                UnifiedDiffLine::Removed(s) => (format!("-{s}"), Style::default().fg(Color::Red)),
+                UnifiedDiffLine::Context(s) => (format!(" {s}"), Style::default()),
+                UnifiedDiffLine::HunkHeader(s) => {
+                    (s.clone(), Style::default().fg(Color::Cyan))
+                }
+            };
+
+            let line = Line::from(Span::styled(text, style));
+            let y = inner.y + i as u16;
+            if y < inner.y + inner.height {
+                buf.set_line(inner.x, y, &line, inner.width);
+            }
+        }
+    }
+
+    /// Move cursor down by one line, auto-scrolling viewport if needed.
+    pub fn cursor_down(&mut self) {
+        let max = self.total_lines().saturating_sub(1);
+        if self.cursor_line < max {
+            self.cursor_line += 1;
+            self.ensure_cursor_visible();
+        }
+    }
+
+    /// Move cursor up by one line, auto-scrolling viewport if needed.
+    pub fn cursor_up(&mut self) {
+        if self.cursor_line > 0 {
+            self.cursor_line -= 1;
+            self.ensure_cursor_visible();
+        }
+    }
+
+    /// Get the path of the currently loaded file, if any.
+    pub fn current_file(&self) -> Option<&Path> {
+        match &self.content {
+            ViewerContent::File { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    /// Ensure the cursor line is visible within the viewport.
+    fn ensure_cursor_visible(&mut self) {
+        if self.cursor_line < self.scroll_offset {
+            self.scroll_offset = self.cursor_line;
+        } else if self.cursor_line >= self.scroll_offset + self.visible_height {
+            self.scroll_offset = self.cursor_line - self.visible_height + 1;
         }
     }
 }
@@ -198,21 +405,41 @@ impl Component for FileViewer {
     fn handle_event(&mut self, key: KeyEvent) -> anyhow::Result<Action> {
         match (key.code, key.modifiers) {
             (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, _) => {
-                self.scroll_down(1);
+                self.cursor_down();
                 Ok(Action::None)
             }
             (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, _) => {
-                self.scroll_up(1);
+                self.cursor_up();
+                Ok(Action::None)
+            }
+            (KeyCode::Char('c'), KeyModifiers::NONE) => Ok(Action::StartComment),
+            (KeyCode::Char('x'), KeyModifiers::NONE) => Ok(Action::DeleteComment),
+            (KeyCode::Char('V'), KeyModifiers::SHIFT) => Ok(Action::StartLineSelect),
+            (KeyCode::Char('e'), KeyModifiers::NONE) => Ok(Action::ExportComments),
+            (KeyCode::Char('d'), KeyModifiers::NONE) => {
+                // Toggle diff mode (only when unified diff data is available)
+                if self.unified_diff.is_some() {
+                    self.diff_mode = !self.diff_mode;
+                    self.scroll_offset = 0;
+                    self.cursor_line = 0;
+                }
                 Ok(Action::None)
             }
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                 let half = self.visible_height / 2;
                 self.scroll_down(half);
+                // Move cursor with the scroll
+                let max = self.total_lines().saturating_sub(1);
+                self.cursor_line = (self.cursor_line + half).min(max);
+                self.ensure_cursor_visible();
                 Ok(Action::None)
             }
             (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
                 let half = self.visible_height / 2;
                 self.scroll_up(half);
+                // Move cursor with the scroll
+                self.cursor_line = self.cursor_line.saturating_sub(half);
+                self.ensure_cursor_visible();
                 Ok(Action::None)
             }
             (KeyCode::Tab, _) => Ok(Action::SwitchFocus),
@@ -273,33 +500,105 @@ mod tests {
         }
     }
 
-    // 4.3: Scrolling
+    // Cursor line
     #[test]
-    fn scroll_down_line_by_line() {
+    fn initial_cursor_line_is_zero() {
+        let (_tmp, path) = tmp_file("test.rs", b"line1\nline2\nline3");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        assert_eq!(viewer.cursor_line, 0);
+    }
+
+    #[test]
+    fn j_moves_cursor_down() {
         let content: Vec<u8> = (0..100).map(|i| format!("line {i}\n")).collect::<String>().into();
         let (_tmp, path) = tmp_file("long.txt", &content);
         let mut viewer = FileViewer::new();
         viewer.load_file(&path);
-        assert_eq!(viewer.scroll_offset, 0);
 
         viewer.handle_event(key(KeyCode::Char('j'))).unwrap();
-        assert_eq!(viewer.scroll_offset, 1);
+        assert_eq!(viewer.cursor_line, 1);
     }
 
     #[test]
-    fn scroll_up_line_by_line() {
+    fn k_moves_cursor_up() {
         let content: Vec<u8> = (0..100).map(|i| format!("line {i}\n")).collect::<String>().into();
         let (_tmp, path) = tmp_file("long.txt", &content);
         let mut viewer = FileViewer::new();
         viewer.load_file(&path);
-        viewer.scroll_offset = 5;
+        viewer.cursor_line = 5;
 
         viewer.handle_event(key(KeyCode::Char('k'))).unwrap();
-        assert_eq!(viewer.scroll_offset, 4);
+        assert_eq!(viewer.cursor_line, 4);
     }
 
     #[test]
-    fn scroll_down_half_page_with_ctrl_d() {
+    fn cursor_clamped_at_end() {
+        let (_tmp, path) = tmp_file("short.txt", b"line1\nline2");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.cursor_line = 1; // last line
+
+        viewer.handle_event(key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(viewer.cursor_line, 1); // stays at max
+    }
+
+    #[test]
+    fn cursor_clamped_at_beginning() {
+        let (_tmp, path) = tmp_file("short.txt", b"line1\nline2");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+
+        viewer.handle_event(key(KeyCode::Char('k'))).unwrap();
+        assert_eq!(viewer.cursor_line, 0); // stays at 0
+    }
+
+    #[test]
+    fn cursor_scrolls_viewport_when_moving_below() {
+        let content: Vec<u8> = (0..100).map(|i| format!("line {i}\n")).collect::<String>().into();
+        let (_tmp, path) = tmp_file("long.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.visible_height = 10;
+        viewer.load_file(&path);
+        // Move cursor to bottom of viewport
+        viewer.cursor_line = 9;
+        viewer.handle_event(key(KeyCode::Char('j'))).unwrap();
+        // Cursor moved to line 10, viewport should scroll to keep it visible
+        assert_eq!(viewer.cursor_line, 10);
+        assert!(viewer.scroll_offset > 0);
+    }
+
+    #[test]
+    fn cursor_scrolls_viewport_when_moving_above() {
+        let content: Vec<u8> = (0..100).map(|i| format!("line {i}\n")).collect::<String>().into();
+        let (_tmp, path) = tmp_file("long.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.visible_height = 10;
+        viewer.load_file(&path);
+        viewer.scroll_offset = 20;
+        viewer.cursor_line = 20;
+        viewer.handle_event(key(KeyCode::Char('k'))).unwrap();
+        assert_eq!(viewer.cursor_line, 19);
+        // Viewport should stay or adjust so cursor is visible
+        assert!(viewer.scroll_offset <= 19);
+    }
+
+    #[test]
+    fn arrow_keys_move_cursor() {
+        let content: Vec<u8> = (0..10).map(|i| format!("line {i}\n")).collect::<String>().into();
+        let (_tmp, path) = tmp_file("file.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+
+        viewer.handle_event(key(KeyCode::Down)).unwrap();
+        assert_eq!(viewer.cursor_line, 1);
+
+        viewer.handle_event(key(KeyCode::Up)).unwrap();
+        assert_eq!(viewer.cursor_line, 0);
+    }
+
+    #[test]
+    fn ctrl_d_scrolls_half_page_and_moves_cursor() {
         let content: Vec<u8> = (0..100).map(|i| format!("line {i}\n")).collect::<String>().into();
         let (_tmp, path) = tmp_file("long.txt", &content);
         let mut viewer = FileViewer::new();
@@ -307,55 +606,24 @@ mod tests {
         viewer.load_file(&path);
 
         viewer.handle_event(ctrl_key('d')).unwrap();
-        assert_eq!(viewer.scroll_offset, 10); // half of 20
+        assert_eq!(viewer.scroll_offset, 10);
+        // Cursor should move with scroll
+        assert_eq!(viewer.cursor_line, 10);
     }
 
     #[test]
-    fn scroll_up_half_page_with_ctrl_u() {
+    fn ctrl_u_scrolls_half_page_and_moves_cursor() {
         let content: Vec<u8> = (0..100).map(|i| format!("line {i}\n")).collect::<String>().into();
         let (_tmp, path) = tmp_file("long.txt", &content);
         let mut viewer = FileViewer::new();
         viewer.visible_height = 20;
         viewer.load_file(&path);
         viewer.scroll_offset = 20;
+        viewer.cursor_line = 20;
 
         viewer.handle_event(ctrl_key('u')).unwrap();
         assert_eq!(viewer.scroll_offset, 10);
-    }
-
-    #[test]
-    fn scroll_clamped_at_end() {
-        let (_tmp, path) = tmp_file("short.txt", b"line1\nline2");
-        let mut viewer = FileViewer::new();
-        viewer.load_file(&path);
-        viewer.scroll_offset = 1; // max for 2 lines
-
-        viewer.handle_event(key(KeyCode::Char('j'))).unwrap();
-        assert_eq!(viewer.scroll_offset, 1); // stays at max
-    }
-
-    #[test]
-    fn scroll_clamped_at_beginning() {
-        let (_tmp, path) = tmp_file("short.txt", b"line1\nline2");
-        let mut viewer = FileViewer::new();
-        viewer.load_file(&path);
-
-        viewer.handle_event(key(KeyCode::Char('k'))).unwrap();
-        assert_eq!(viewer.scroll_offset, 0); // stays at 0
-    }
-
-    #[test]
-    fn scroll_with_arrow_keys() {
-        let content: Vec<u8> = (0..10).map(|i| format!("line {i}\n")).collect::<String>().into();
-        let (_tmp, path) = tmp_file("file.txt", &content);
-        let mut viewer = FileViewer::new();
-        viewer.load_file(&path);
-
-        viewer.handle_event(key(KeyCode::Down)).unwrap();
-        assert_eq!(viewer.scroll_offset, 1);
-
-        viewer.handle_event(key(KeyCode::Up)).unwrap();
-        assert_eq!(viewer.scroll_offset, 0);
+        assert_eq!(viewer.cursor_line, 10);
     }
 
     // 4.4: Binary detection
@@ -533,5 +801,25 @@ mod tests {
         let area = Rect::new(0, 0, 40, 5);
         let mut buf = Buffer::empty(area);
         viewer.render_to_buffer(area, &mut buf, false);
+    }
+
+    #[test]
+    fn nonexistent_file_shows_deleted_message() {
+        let mut viewer = FileViewer::new();
+        viewer.load_file(Path::new("/nonexistent/deleted_file.rs"));
+
+        match &viewer.content {
+            ViewerContent::Error(msg) => {
+                assert!(
+                    msg.contains("deleted") || msg.contains("Deleted"),
+                    "Error for nonexistent file should mention deletion, got: {msg}"
+                );
+                assert!(
+                    !msg.contains("os error"),
+                    "Error should not expose raw OS error, got: {msg}"
+                );
+            }
+            other => panic!("Expected Error content, got {:?}", other),
+        }
     }
 }

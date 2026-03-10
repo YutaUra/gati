@@ -10,20 +10,34 @@ use ratatui::{
 };
 
 use crate::components::{Action, Component};
-use crate::tree::FileTreeModel;
+use crate::git_status::{FileStatus, GitStatus};
+use crate::tree::{self, FileTreeModel, TreeEntry};
+
+/// Search mode state.
+pub struct SearchState {
+    pub query: String,
+    saved_entries: Vec<TreeEntry>,
+    saved_selected: usize,
+    saved_scroll_offset: usize,
+    /// Root directory for recursive search.
+    root: std::path::PathBuf,
+}
 
 pub struct FileTree {
     pub model: FileTreeModel,
     /// Scroll offset for the tree view.
     pub scroll_offset: usize,
+    /// Active search state (None when not searching).
+    pub search: Option<SearchState>,
 }
 
 impl FileTree {
-    pub fn new(root: &Path) -> anyhow::Result<Self> {
-        let model = FileTreeModel::from_dir(root)?;
+    pub fn new(root: &Path, git_status: Option<GitStatus>) -> anyhow::Result<Self> {
+        let model = FileTreeModel::from_dir(root, git_status)?;
         Ok(Self {
             model,
             scroll_offset: 0,
+            search: None,
         })
     }
 
@@ -34,10 +48,18 @@ impl FileTree {
             Style::default().fg(Color::DarkGray)
         };
 
+        let title = if let Some(ref search) = self.search {
+            format!(" Files [/{}] ", search.query)
+        } else if self.model.filter_changed {
+            " Changed Files ".to_string()
+        } else {
+            " Files ".to_string()
+        };
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
-            .title(" Files ");
+            .title(title.as_str());
 
         let inner = block.inner(area);
         block.render(area, buf);
@@ -72,15 +94,50 @@ impl FileTree {
                 Style::default()
             };
 
-            let line = Line::from(vec![Span::styled(
-                format!("{indent}{icon}{}", entry.name()),
-                style,
-            )]);
+            let name_text = format!("{indent}{icon}{}", entry.name());
+            let mut spans = vec![Span::styled(name_text, style)];
+
+            // Git status marker
+            let marker_info = if entry.is_directory {
+                if self.model.dir_has_changes(&entry.path) {
+                    Some((" [●]", Color::Yellow))
+                } else {
+                    None
+                }
+            } else {
+                entry.git_status.map(|fs| match fs {
+                    FileStatus::Modified => (" [M]", Color::Yellow),
+                    FileStatus::Added => (" [A]", Color::Green),
+                    FileStatus::Deleted => (" [D]", Color::Red),
+                    FileStatus::Renamed => (" [R]", Color::Blue),
+                    FileStatus::Untracked => (" [?]", Color::Green),
+                })
+            };
+
+            if let Some((marker, color)) = marker_info {
+                let marker_style = if is_selected {
+                    Style::default().fg(color).bg(Color::White)
+                } else {
+                    Style::default().fg(color)
+                };
+                spans.push(Span::styled(marker, marker_style));
+            }
+
+            let line = Line::from(spans);
 
             let y = inner.y + i as u16;
             if y < inner.y + inner.height {
                 buf.set_line(inner.x, y, &line, inner.width);
             }
+        }
+
+        // Show "No matches" when search is active and entries are empty
+        if self.search.is_some() && self.model.entries.is_empty() {
+            let msg = Line::from(Span::styled(
+                "No matches",
+                Style::default().fg(Color::DarkGray),
+            ));
+            buf.set_line(inner.x, inner.y, &msg, inner.width);
         }
     }
 
@@ -134,12 +191,133 @@ impl FileTree {
     }
 }
 
+impl FileTree {
+    /// Activate search mode.
+    fn enter_search(&mut self) {
+        let root = self
+            .model
+            .entries
+            .first()
+            .map(|e| {
+                // Derive root from the first entry's parent
+                e.path.parent().unwrap_or(&e.path).to_path_buf()
+            })
+            .unwrap_or_default();
+
+        self.search = Some(SearchState {
+            query: String::new(),
+            saved_entries: self.model.entries.clone(),
+            saved_selected: self.model.selected,
+            saved_scroll_offset: self.scroll_offset,
+            root,
+        });
+    }
+
+    /// Exit search mode, keeping or restoring state.
+    fn exit_search(&mut self, confirm: bool) {
+        if let Some(search) = self.search.take() {
+            if confirm {
+                // Keep current entries and selection — the selected file stays
+            } else {
+                // Restore saved state
+                self.model.entries = search.saved_entries;
+                self.model.selected = search.saved_selected;
+                self.scroll_offset = search.saved_scroll_offset;
+            }
+        }
+    }
+
+    /// Update search results based on current query.
+    fn update_search_results(&mut self) -> anyhow::Result<()> {
+        let Some(ref search) = self.search else {
+            return Ok(());
+        };
+
+        if search.query.is_empty() {
+            // Empty query: restore original entries
+            self.model.entries = search.saved_entries.clone();
+            self.model.selected = 0;
+            self.scroll_offset = 0;
+            return Ok(());
+        }
+
+        let mut entries = tree::search_files(&search.root, &search.query)?;
+
+        // Annotate with git status if available
+        if let Some(ref gs) = self.model.git_status_ref() {
+            for entry in entries.iter_mut() {
+                if !entry.is_directory {
+                    entry.git_status = gs.file_status(&entry.path);
+                }
+            }
+        }
+
+        self.model.entries = entries;
+        self.model.selected = 0;
+        self.scroll_offset = 0;
+        Ok(())
+    }
+
+    fn handle_search_event(&mut self, key: KeyEvent) -> anyhow::Result<Action> {
+        match key.code {
+            KeyCode::Enter => {
+                // Confirm: if a file is selected, open it
+                let action = if let Some(entry) = self.model.selected_entry() {
+                    if !entry.is_directory {
+                        Action::FileOpened(entry.path.clone())
+                    } else {
+                        Action::None
+                    }
+                } else {
+                    Action::None
+                };
+                self.exit_search(true);
+                Ok(action)
+            }
+            KeyCode::Esc => {
+                self.exit_search(false);
+                Ok(Action::None)
+            }
+            KeyCode::Char(c) => {
+                if let Some(ref mut search) = self.search {
+                    search.query.push(c);
+                }
+                self.update_search_results()?;
+                Ok(Action::None)
+            }
+            KeyCode::Backspace => {
+                if let Some(ref mut search) = self.search {
+                    search.query.pop();
+                }
+                self.update_search_results()?;
+                Ok(Action::None)
+            }
+            KeyCode::Down => {
+                let action = self.move_selection(1);
+                self.ensure_visible(20);
+                Ok(action)
+            }
+            KeyCode::Up => {
+                let action = self.move_selection(-1);
+                self.ensure_visible(20);
+                Ok(action)
+            }
+            _ => Ok(Action::None),
+        }
+    }
+}
+
 impl Component for FileTree {
     fn handle_event(&mut self, key: KeyEvent) -> anyhow::Result<Action> {
+        // Search mode handles its own events
+        if self.search.is_some() {
+            return self.handle_search_event(key);
+        }
+
         match (key.code, key.modifiers) {
             (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, _) => {
                 let action = self.move_selection(1);
-                self.ensure_visible(20); // Will use actual height when rendering
+                self.ensure_visible(20);
                 Ok(action)
             }
             (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, _) => {
@@ -158,10 +336,8 @@ impl Component for FileTree {
             (KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Left, _) => {
                 if let Some(entry) = self.model.selected_entry() {
                     if entry.is_directory && entry.is_expanded {
-                        // Collapse this directory
                         self.model.toggle_expand()?;
                     } else if let Some(parent_idx) = self.find_parent_index() {
-                        // Collapse parent directory and move cursor to it
                         self.model.selected = parent_idx;
                         self.model.toggle_expand()?;
                         self.ensure_visible(20);
@@ -176,6 +352,16 @@ impl Component for FileTree {
                         return Ok(Action::FileOpened(path));
                     }
                 }
+                Ok(Action::None)
+            }
+            (KeyCode::Char('/'), KeyModifiers::NONE) => {
+                self.enter_search();
+                Ok(Action::None)
+            }
+            (KeyCode::Char('g'), KeyModifiers::NONE) => {
+                self.model.toggle_filter()?;
+                self.scroll_offset = 0;
+                self.ensure_visible(20);
                 Ok(Action::None)
             }
             (KeyCode::Tab, _) => Ok(Action::SwitchFocus),
@@ -214,7 +400,7 @@ mod tests {
     #[test]
     fn move_down_with_j_selects_next_entry() {
         let tmp = setup_dir(&["a.rs", "b.rs", "c.rs"], &[]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         assert_eq!(tree.model.selected, 0);
 
         let action = tree.handle_event(key(KeyCode::Char('j'))).unwrap();
@@ -225,7 +411,7 @@ mod tests {
     #[test]
     fn move_up_with_k_selects_previous_entry() {
         let tmp = setup_dir(&["a.rs", "b.rs"], &[]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         tree.model.selected = 1;
 
         tree.handle_event(key(KeyCode::Char('k'))).unwrap();
@@ -235,7 +421,7 @@ mod tests {
     #[test]
     fn move_down_with_arrow_key() {
         let tmp = setup_dir(&["a.rs", "b.rs"], &[]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         tree.handle_event(key(KeyCode::Down)).unwrap();
         assert_eq!(tree.model.selected, 1);
     }
@@ -243,7 +429,7 @@ mod tests {
     #[test]
     fn move_up_with_arrow_key() {
         let tmp = setup_dir(&["a.rs", "b.rs"], &[]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         tree.model.selected = 1;
         tree.handle_event(key(KeyCode::Up)).unwrap();
         assert_eq!(tree.model.selected, 0);
@@ -252,7 +438,7 @@ mod tests {
     #[test]
     fn selection_clamped_at_bottom() {
         let tmp = setup_dir(&["a.rs", "b.rs"], &[]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         tree.model.selected = 1; // last entry
         tree.handle_event(key(KeyCode::Char('j'))).unwrap();
         assert_eq!(tree.model.selected, 1); // stays at last
@@ -261,7 +447,7 @@ mod tests {
     #[test]
     fn selection_clamped_at_top() {
         let tmp = setup_dir(&["a.rs", "b.rs"], &[]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         tree.handle_event(key(KeyCode::Char('k'))).unwrap();
         assert_eq!(tree.model.selected, 0); // stays at first
     }
@@ -270,7 +456,7 @@ mod tests {
     #[test]
     fn ensure_visible_scrolls_down() {
         let tmp = setup_dir(&["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"], &[]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         tree.model.selected = 4; // beyond visible area of height 3
         tree.ensure_visible(3);
         assert_eq!(tree.scroll_offset, 2); // 4 - 3 + 1
@@ -279,7 +465,7 @@ mod tests {
     #[test]
     fn ensure_visible_scrolls_up() {
         let tmp = setup_dir(&["a.rs", "b.rs", "c.rs"], &[]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         tree.scroll_offset = 2;
         tree.model.selected = 0;
         tree.ensure_visible(3);
@@ -290,7 +476,7 @@ mod tests {
     #[test]
     fn l_expands_collapsed_directory() {
         let tmp = setup_dir(&["sub/child.rs"], &["sub"]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         assert!(tree.model.entries[0].is_directory);
         assert!(!tree.model.entries[0].is_expanded);
 
@@ -302,7 +488,7 @@ mod tests {
     #[test]
     fn right_arrow_expands_collapsed_directory() {
         let tmp = setup_dir(&["sub/child.rs"], &["sub"]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         assert!(!tree.model.entries[0].is_expanded);
 
         tree.handle_event(key(KeyCode::Right)).unwrap();
@@ -312,7 +498,7 @@ mod tests {
     #[test]
     fn h_collapses_expanded_directory() {
         let tmp = setup_dir(&["sub/child.rs"], &["sub"]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         // Expand first
         tree.handle_event(key(KeyCode::Char('l'))).unwrap();
         assert!(tree.model.entries[0].is_expanded);
@@ -325,7 +511,7 @@ mod tests {
     #[test]
     fn left_arrow_collapses_expanded_directory() {
         let tmp = setup_dir(&["sub/child.rs"], &["sub"]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         tree.handle_event(key(KeyCode::Char('l'))).unwrap();
         assert!(tree.model.entries[0].is_expanded);
 
@@ -336,7 +522,7 @@ mod tests {
     #[test]
     fn h_on_root_level_collapsed_directory_is_noop() {
         let tmp = setup_dir(&["sub/child.rs"], &["sub"]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         // "sub" is at depth 0, collapsed — no parent to collapse
         assert!(!tree.model.entries[0].is_expanded);
 
@@ -349,7 +535,7 @@ mod tests {
     #[test]
     fn h_on_root_level_file_is_noop() {
         let tmp = setup_dir(&["file.rs"], &[]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         // "file.rs" is at depth 0 — no parent to collapse
         let action = tree.handle_event(key(KeyCode::Char('h'))).unwrap();
         assert_eq!(action, Action::None);
@@ -359,7 +545,7 @@ mod tests {
     #[test]
     fn h_on_child_file_collapses_parent_and_moves_cursor() {
         let tmp = setup_dir(&["sub/child.rs"], &["sub"]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         // Expand "sub" directory
         tree.handle_event(key(KeyCode::Char('l'))).unwrap();
         assert!(tree.model.entries[0].is_expanded);
@@ -378,7 +564,7 @@ mod tests {
     #[test]
     fn h_on_nested_collapsed_directory_collapses_parent() {
         let tmp = setup_dir(&["parent/child/file.rs"], &["parent", "parent/child"]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         // Expand "parent"
         tree.handle_event(key(KeyCode::Char('l'))).unwrap();
         assert!(tree.model.entries[0].is_expanded);
@@ -398,7 +584,7 @@ mod tests {
     #[test]
     fn left_arrow_on_child_file_collapses_parent() {
         let tmp = setup_dir(&["sub/child.rs"], &["sub"]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         tree.handle_event(key(KeyCode::Right)).unwrap();
         tree.model.selected = 1;
 
@@ -410,7 +596,7 @@ mod tests {
     #[test]
     fn l_on_file_is_noop() {
         let tmp = setup_dir(&["file.rs"], &[]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         assert!(!tree.model.entries[0].is_directory);
 
         let action = tree.handle_event(key(KeyCode::Char('l'))).unwrap();
@@ -420,7 +606,7 @@ mod tests {
     #[test]
     fn enter_on_directory_is_noop() {
         let tmp = setup_dir(&["sub/child.rs"], &["sub"]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         assert!(tree.model.entries[0].is_directory);
 
         let action = tree.handle_event(key(KeyCode::Enter)).unwrap();
@@ -432,7 +618,7 @@ mod tests {
     #[test]
     fn enter_on_file_returns_file_opened() {
         let tmp = setup_dir(&["file.rs"], &[]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         let action = tree.handle_event(key(KeyCode::Enter)).unwrap();
         assert!(matches!(action, Action::FileOpened(_)));
     }
@@ -441,7 +627,7 @@ mod tests {
     #[test]
     fn moving_to_file_returns_file_selected() {
         let tmp = setup_dir(&["a.rs", "b.rs"], &[]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         let action = tree.handle_event(key(KeyCode::Char('j'))).unwrap();
         assert!(matches!(action, Action::FileSelected(_)));
     }
@@ -449,7 +635,7 @@ mod tests {
     #[test]
     fn moving_to_directory_returns_none() {
         let tmp = setup_dir(&["a.rs"], &["sub"]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         // entries: [sub(dir), a.rs(file)] — sorted dirs first
         // selected = 0 (sub), move down to a.rs
         // Actually first is sub (dir), so moving down goes to a.rs (file)
@@ -463,7 +649,7 @@ mod tests {
     #[test]
     fn tab_returns_switch_focus() {
         let tmp = setup_dir(&["file.rs"], &[]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         let action = tree.handle_event(key(KeyCode::Tab)).unwrap();
         assert_eq!(action, Action::SwitchFocus);
     }
@@ -471,7 +657,7 @@ mod tests {
     #[test]
     fn q_returns_quit() {
         let tmp = setup_dir(&["file.rs"], &[]);
-        let mut tree = FileTree::new(tmp.path()).unwrap();
+        let mut tree = FileTree::new(tmp.path(), None).unwrap();
         let action = tree.handle_event(key(KeyCode::Char('q'))).unwrap();
         assert_eq!(action, Action::Quit);
     }
