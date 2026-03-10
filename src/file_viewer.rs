@@ -63,6 +63,8 @@ pub struct FileViewer {
     pub line_diff: Option<LineDiff>,
     /// Parsed unified diff for diff mode.
     pub unified_diff: Option<UnifiedDiff>,
+    /// Pre-computed syntax-highlighted spans for each unified diff line.
+    pub diff_highlighted_lines: Vec<Vec<Span<'static>>>,
     /// Whether the viewer is currently in diff mode.
     pub diff_mode: bool,
     /// Comments for the currently viewed file (set before each render by App).
@@ -82,6 +84,7 @@ impl FileViewer {
             highlighted_lines: Vec::new(),
             line_diff: None,
             unified_diff: None,
+            diff_highlighted_lines: Vec::new(),
             diff_mode: false,
             comments: Vec::new(),
         }
@@ -90,6 +93,45 @@ impl FileViewer {
     /// Set diff data for the currently loaded file.
     pub fn set_diff(&mut self, line_diff: Option<LineDiff>, unified_diff: Option<UnifiedDiff>) {
         self.line_diff = line_diff;
+        self.diff_highlighted_lines.clear();
+
+        // Pre-compute syntax-highlighted spans for diff lines using the file's language
+        if let Some(ref diff) = unified_diff {
+            let syntax = match &self.content {
+                ViewerContent::File { path, .. } => {
+                    let first_line = diff.lines.iter().find_map(|l| match l {
+                        UnifiedDiffLine::Context(s) | UnifiedDiffLine::Added(s) => Some(s.as_str()),
+                        _ => None,
+                    }).unwrap_or("");
+                    self.highlighter.detect_syntax(path, first_line).name.clone()
+                }
+                _ => "Plain Text".to_string(),
+            };
+
+            let syntax_ref = self.highlighter.syntax_set
+                .find_syntax_by_name(&syntax)
+                .unwrap_or_else(|| self.highlighter.syntax_set.find_syntax_plain_text());
+            let mut hl_state = self.highlighter.new_highlight_state(syntax_ref);
+
+            for diff_line in &diff.lines {
+                match diff_line {
+                    UnifiedDiffLine::HunkHeader(_) => {
+                        // No syntax highlighting for hunk headers
+                        self.diff_highlighted_lines.push(Vec::new());
+                    }
+                    UnifiedDiffLine::Context(s)
+                    | UnifiedDiffLine::Added(s)
+                    | UnifiedDiffLine::Removed(s) => {
+                        let spans = self.highlighter.highlight_line(
+                            &mut hl_state,
+                            &format!("{s}\n"),
+                        );
+                        self.diff_highlighted_lines.push(spans);
+                    }
+                }
+            }
+        }
+
         self.unified_diff = unified_diff;
     }
 
@@ -102,6 +144,7 @@ impl FileViewer {
         self.line_diff = None;
         self.unified_diff = None;
         self.highlighted_lines.clear();
+        self.diff_highlighted_lines.clear();
 
         // Try to read the file
         let bytes = match std::fs::read(path) {
@@ -159,7 +202,9 @@ impl FileViewer {
 
     fn total_lines(&self) -> usize {
         if self.diff_mode {
-            return self.unified_diff.as_ref().map_or(0, |d| d.lines.len());
+            return self.unified_diff.as_ref().map_or(0, |d| {
+                d.lines.iter().filter(|l| !matches!(l, UnifiedDiffLine::HunkHeader(_))).count()
+            });
         }
         match &self.content {
             ViewerContent::File { lines, .. } => lines.len(),
@@ -375,7 +420,7 @@ impl FileViewer {
         }
     }
 
-    /// Render unified diff content.
+    /// Render unified diff content with language syntax highlighting.
     fn render_diff_mode(&self, inner: Rect, buf: &mut Buffer) {
         let Some(ref diff) = self.unified_diff else {
             let msg = "No changes";
@@ -384,33 +429,112 @@ impl FileViewer {
             return;
         };
 
-        if diff.lines.is_empty() {
+        // Collect displayable lines (skip hunk headers), keeping original indices
+        // for diff_highlighted_lines lookup
+        let displayable: Vec<(usize, &UnifiedDiffLine)> = diff
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| !matches!(l, UnifiedDiffLine::HunkHeader(_)))
+            .collect();
+
+        if displayable.is_empty() {
             let msg = "No changes";
             let line = Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray)));
             buf.set_line(inner.x, inner.y, &line, inner.width);
             return;
         }
 
-        for (i, diff_line) in diff
-            .lines
+        // Use the file's total line count for gutter width so it matches preview mode
+        let file_line_count = match &self.content {
+            ViewerContent::File { lines, .. } => lines.len(),
+            _ => displayable.iter().filter(|(_, l)| {
+                !matches!(l, UnifiedDiffLine::Removed(_))
+            }).count(),
+        };
+        let gutter_width = line_number_width(file_line_count);
+
+        // Track new-file line number (increments for Context and Added, not for Removed)
+        let mut new_lineno: usize = 0;
+        // Pre-compute line numbers for all displayable lines
+        let line_numbers: Vec<Option<usize>> = displayable.iter().map(|(_, l)| {
+            match l {
+                UnifiedDiffLine::Context(_) | UnifiedDiffLine::Added(_) => {
+                    new_lineno += 1;
+                    Some(new_lineno)
+                }
+                _ => None,
+            }
+        }).collect();
+
+        for (render_idx, (disp_idx, (orig_idx, diff_line))) in displayable
             .iter()
+            .enumerate()
             .skip(self.scroll_offset)
             .take(self.visible_height)
             .enumerate()
         {
-            let (text, style) = match diff_line {
-                UnifiedDiffLine::Added(s) => (format!("+{s}"), Style::default().fg(Color::Green)),
-                UnifiedDiffLine::Removed(s) => (format!("-{s}"), Style::default().fg(Color::Red)),
-                UnifiedDiffLine::Context(s) => (format!(" {s}"), Style::default()),
-                UnifiedDiffLine::HunkHeader(s) => {
-                    (s.clone(), Style::default().fg(Color::Cyan))
-                }
+            let y = inner.y + render_idx as u16;
+            if y >= inner.y + inner.height {
+                break;
+            }
+
+            // Prefix (+/-/space) in the same column as the diff marker (▎) in preview mode
+            let prefix = match diff_line {
+                UnifiedDiffLine::Added(_) => "+",
+                UnifiedDiffLine::Removed(_) => "-",
+                _ => " ",
+            };
+            let prefix_style = match diff_line {
+                UnifiedDiffLine::Added(_) => Style::default().fg(Color::Green),
+                UnifiedDiffLine::Removed(_) => Style::default().fg(Color::Red),
+                _ => Style::default().fg(Color::DarkGray),
             };
 
-            let line = Line::from(Span::styled(text, style));
-            let y = inner.y + i as u16;
-            if y < inner.y + inner.height {
-                buf.set_line(inner.x, y, &line, inner.width);
+            // Line number gutter (same position as preview mode)
+            let num_str = match line_numbers[disp_idx] {
+                Some(n) => format!("{:>width$} ", n, width = gutter_width),
+                None => format!("{:>width$} ", "", width = gutter_width),
+            };
+
+            let mut spans = vec![
+                Span::styled(prefix, prefix_style),
+                Span::styled(num_str, Style::default().fg(Color::DarkGray)),
+            ];
+
+            // Use pre-computed syntax-highlighted spans if available
+            if *orig_idx < self.diff_highlighted_lines.len()
+                && !self.diff_highlighted_lines[*orig_idx].is_empty()
+            {
+                spans.extend(self.diff_highlighted_lines[*orig_idx].clone());
+            } else {
+                let text = match diff_line {
+                    UnifiedDiffLine::Added(s)
+                    | UnifiedDiffLine::Removed(s)
+                    | UnifiedDiffLine::Context(s) => s.as_str(),
+                    _ => "",
+                };
+                spans.push(Span::raw(text.to_string()));
+            }
+
+            let line = Line::from(spans);
+            buf.set_line(inner.x, y, &line, inner.width);
+
+            // Apply background tint for added/removed lines
+            match diff_line {
+                UnifiedDiffLine::Added(_) => {
+                    for x in inner.x..inner.x + inner.width {
+                        let cell = &mut buf[(x, y)];
+                        cell.set_bg(Color::Rgb(0, 40, 0));
+                    }
+                }
+                UnifiedDiffLine::Removed(_) => {
+                    for x in inner.x..inner.x + inner.width {
+                        let cell = &mut buf[(x, y)];
+                        cell.set_bg(Color::Rgb(40, 0, 0));
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -948,6 +1072,230 @@ mod tests {
             }
             other => panic!("Expected Error content, got {:?}", other),
         }
+    }
+
+    // Diff mode syntax highlighting
+    #[test]
+    fn diff_highlighted_lines_populated_on_set_diff() {
+        let (_tmp, path) = tmp_file("test.rs", b"fn main() {\n    println!(\"hi\");\n}\n");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+
+        let diff = UnifiedDiff {
+            lines: vec![
+                UnifiedDiffLine::HunkHeader("@@ -1,3 +1,3 @@".to_string()),
+                UnifiedDiffLine::Context("fn main() {".to_string()),
+                UnifiedDiffLine::Removed("    println!(\"hi\");".to_string()),
+                UnifiedDiffLine::Added("    println!(\"hello\");".to_string()),
+                UnifiedDiffLine::Context("}".to_string()),
+            ],
+        };
+        viewer.set_diff(None, Some(diff));
+
+        // Should have pre-computed highlighted spans for each diff line
+        assert_eq!(viewer.diff_highlighted_lines.len(), 5);
+
+        // Hunk header should have no syntax highlighting (empty spans)
+        assert!(viewer.diff_highlighted_lines[0].is_empty());
+
+        // Code lines should have syntax-highlighted spans with RGB colors
+        let code_spans = &viewer.diff_highlighted_lines[1]; // "fn main() {"
+        assert!(!code_spans.is_empty());
+        // At least one span should have RGB color from syntect
+        assert!(
+            code_spans.iter().any(|s| matches!(s.style.fg, Some(Color::Rgb(_, _, _)))),
+            "Code spans should have RGB colors from syntax highlighting"
+        );
+    }
+
+    #[test]
+    fn diff_mode_render_with_syntax_highlighting_does_not_panic() {
+        let (_tmp, path) = tmp_file("test.rs", b"fn main() {\n    println!(\"hi\");\n}\n");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+
+        let diff = UnifiedDiff {
+            lines: vec![
+                UnifiedDiffLine::HunkHeader("@@ -1,3 +1,3 @@".to_string()),
+                UnifiedDiffLine::Context("fn main() {".to_string()),
+                UnifiedDiffLine::Removed("    println!(\"hi\");".to_string()),
+                UnifiedDiffLine::Added("    println!(\"hello\");".to_string()),
+                UnifiedDiffLine::Context("}".to_string()),
+            ],
+        };
+        viewer.set_diff(None, Some(diff));
+        viewer.diff_mode = true;
+
+        let area = Rect::new(0, 0, 60, 10);
+        let mut buf = Buffer::empty(area);
+        viewer.render_to_buffer(area, &mut buf, true);
+        // Should render without panic
+    }
+
+    #[test]
+    fn diff_mode_does_not_render_hunk_headers() {
+        let (_tmp, path) = tmp_file("test.rs", b"fn main() {}\n");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+
+        let diff = UnifiedDiff {
+            lines: vec![
+                UnifiedDiffLine::HunkHeader("@@ -1,1 +1,1 @@".to_string()),
+                UnifiedDiffLine::Context("fn main() {}".to_string()),
+            ],
+        };
+        viewer.set_diff(None, Some(diff));
+        viewer.diff_mode = true;
+
+        let area = Rect::new(0, 0, 60, 10);
+        let mut buf = Buffer::empty(area);
+        viewer.render_to_buffer(area, &mut buf, true);
+
+        // Extract rendered text from first row
+        let row_text: String = (0..60).map(|x| buf[(x, 1)].symbol().to_string()).collect();
+        assert!(
+            !row_text.contains("@@"),
+            "Hunk headers should not appear in diff view, got: {row_text}"
+        );
+    }
+
+    #[test]
+    fn diff_mode_shows_line_numbers_for_context_and_added() {
+        let (_tmp, path) = tmp_file("test.rs", b"line1\nline2\nline3\n");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+
+        let diff = UnifiedDiff {
+            lines: vec![
+                UnifiedDiffLine::HunkHeader("@@ -1,3 +1,4 @@".to_string()),
+                UnifiedDiffLine::Context("line1".to_string()),
+                UnifiedDiffLine::Context("line2".to_string()),
+                UnifiedDiffLine::Added("new_line".to_string()),
+                UnifiedDiffLine::Context("line3".to_string()),
+            ],
+        };
+        viewer.set_diff(None, Some(diff));
+        viewer.diff_mode = true;
+
+        let area = Rect::new(0, 0, 60, 10);
+        let mut buf = Buffer::empty(area);
+        viewer.render_to_buffer(area, &mut buf, true);
+
+        // Row 1 (inner y=1): Context "line1" → line number 1
+        let row1: String = (0..10).map(|x| buf[(x, 1)].symbol().to_string()).collect();
+        assert!(row1.contains("1"), "Context line should show line number 1, got: {row1}");
+
+        // Row 3 (inner y=3): Added "new_line" → line number 3
+        let row3: String = (0..10).map(|x| buf[(x, 3)].symbol().to_string()).collect();
+        assert!(row3.contains("3"), "Added line should show line number 3, got: {row3}");
+    }
+
+    #[test]
+    fn diff_mode_no_line_number_for_removed_lines() {
+        let (_tmp, path) = tmp_file("test.rs", b"line1\nline3\n");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+
+        let diff = UnifiedDiff {
+            lines: vec![
+                UnifiedDiffLine::HunkHeader("@@ -1,3 +1,2 @@".to_string()),
+                UnifiedDiffLine::Context("line1".to_string()),
+                UnifiedDiffLine::Removed("line2".to_string()),
+                UnifiedDiffLine::Context("line3".to_string()),
+            ],
+        };
+        viewer.set_diff(None, Some(diff));
+        viewer.diff_mode = true;
+
+        let area = Rect::new(0, 0, 60, 10);
+        let mut buf = Buffer::empty(area);
+        viewer.render_to_buffer(area, &mut buf, true);
+
+        // Row 2 (inner y=2): Removed "line2" → no line number, just spaces in gutter
+        let row2_gutter: String = (0..5).map(|x| buf[(x, 2)].symbol().to_string()).collect();
+        // Should not contain any digit
+        assert!(
+            !row2_gutter.chars().any(|c| c.is_ascii_digit()),
+            "Removed line should not show a line number, got gutter: '{row2_gutter}'"
+        );
+    }
+
+    #[test]
+    fn diff_mode_gutter_aligns_with_preview_mode() {
+        // Gutter layout should be the same width in both modes so line numbers don't shift
+        let (_tmp, path) = tmp_file("test.rs", b"line1\nline2\nline3\n");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+
+        let diff = UnifiedDiff {
+            lines: vec![
+                UnifiedDiffLine::HunkHeader("@@ -1,3 +1,3 @@".to_string()),
+                UnifiedDiffLine::Context("line1".to_string()),
+                UnifiedDiffLine::Removed("line2".to_string()),
+                UnifiedDiffLine::Added("LINE2".to_string()),
+                UnifiedDiffLine::Context("line3".to_string()),
+            ],
+        };
+        viewer.set_diff(Some(crate::diff::LineDiff { lines: vec![crate::diff::DiffLineKind::Unchanged; 3] }), Some(diff));
+
+        let area = Rect::new(0, 0, 60, 10);
+        let mut buf_preview = Buffer::empty(area);
+        viewer.diff_mode = false;
+        viewer.render_to_buffer(area, &mut buf_preview, true);
+
+        let mut buf_diff = Buffer::empty(area);
+        viewer.diff_mode = true;
+        viewer.scroll_offset = 0;
+        viewer.render_to_buffer(area, &mut buf_diff, true);
+
+        // Find where "1" line number starts in preview (first row, inner y=1)
+        let preview_row: String = (0..15).map(|x| buf_preview[(x, 1)].symbol().to_string()).collect();
+        let diff_row: String = (0..15).map(|x| buf_diff[(x, 1)].symbol().to_string()).collect();
+
+        // Find the column of the first digit "1" in each row
+        let preview_num_col = preview_row.find('1').expect("Preview should show line number 1");
+        let diff_num_col = diff_row.find('1').expect("Diff should show line number 1");
+
+        assert_eq!(
+            preview_num_col, diff_num_col,
+            "Line number column should be the same in both modes.\n  Preview: '{preview_row}'\n  Diff:    '{diff_row}'"
+        );
+    }
+
+    #[test]
+    fn diff_mode_total_lines_excludes_hunk_headers() {
+        let (_tmp, path) = tmp_file("test.rs", b"line1\n");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+
+        let diff = UnifiedDiff {
+            lines: vec![
+                UnifiedDiffLine::HunkHeader("@@ -1,1 +1,1 @@".to_string()),
+                UnifiedDiffLine::Context("line1".to_string()),
+            ],
+        };
+        viewer.set_diff(None, Some(diff));
+        viewer.diff_mode = true;
+
+        // total_lines should only count non-hunk-header lines
+        assert_eq!(viewer.total_lines(), 1);
+    }
+
+    #[test]
+    fn diff_highlighted_lines_cleared_on_load_file() {
+        let (_tmp, path) = tmp_file("test.rs", b"fn main() {}\n");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+
+        let diff = UnifiedDiff {
+            lines: vec![UnifiedDiffLine::Context("fn main() {}".to_string())],
+        };
+        viewer.set_diff(None, Some(diff));
+        assert!(!viewer.diff_highlighted_lines.is_empty());
+
+        // Reload a file — diff highlights should be cleared
+        viewer.load_file(&path);
+        assert!(viewer.diff_highlighted_lines.is_empty());
     }
 
     // Horizontal scroll tests

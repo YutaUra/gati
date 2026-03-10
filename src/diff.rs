@@ -137,7 +137,7 @@ pub fn compute_unified_diff(repo_path: &Path, file_path: &Path) -> Option<Unifie
     let old_content = head_content.unwrap_or_default();
 
     let mut opts = git2::DiffOptions::new();
-    opts.context_lines(3);
+    opts.context_lines(u32::MAX);
 
     let patch = git2::Patch::from_buffers(
         old_content.as_bytes(),
@@ -341,6 +341,81 @@ mod tests {
             .lines
             .iter()
             .any(|l| matches!(l, UnifiedDiffLine::HunkHeader(_))));
+    }
+
+    #[test]
+    fn unified_diff_includes_all_lines_as_context() {
+        // 10-line file with one change in the middle: all 10 lines should appear
+        let tmp = setup_git_repo(&[(
+            "file.txt",
+            "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n",
+        )]);
+        let root = canonical_tmp_path(&tmp);
+        fs::write(
+            root.join("file.txt"),
+            "line1\nline2\nline3\nline4\nCHANGED\nline6\nline7\nline8\nline9\nline10\n",
+        )
+        .unwrap();
+
+        let diff = compute_unified_diff(&root, &root.join("file.txt")).unwrap();
+
+        // Count context lines — all unchanged lines should be present as context
+        let context_count = diff
+            .lines
+            .iter()
+            .filter(|l| matches!(l, UnifiedDiffLine::Context(_)))
+            .count();
+        // 10 original lines, 1 changed → 9 context lines
+        assert_eq!(context_count, 9, "all unchanged lines should appear as context");
+
+        // No hunk headers needed when full file is shown
+        let hunk_count = diff
+            .lines
+            .iter()
+            .filter(|l| matches!(l, UnifiedDiffLine::HunkHeader(_)))
+            .count();
+        assert_eq!(hunk_count, 1, "should have exactly one hunk for full-file context");
+    }
+
+    #[test]
+    fn unified_diff_full_context_with_distant_changes() {
+        // Two changes far apart — with full context they should be in one hunk
+        let mut content = String::new();
+        for i in 1..=20 {
+            content.push_str(&format!("line{}\n", i));
+        }
+        let tmp = setup_git_repo(&[("file.txt", &content)]);
+        let root = canonical_tmp_path(&tmp);
+
+        let mut modified = String::new();
+        for i in 1..=20 {
+            if i == 2 {
+                modified.push_str("CHANGED2\n");
+            } else if i == 19 {
+                modified.push_str("CHANGED19\n");
+            } else {
+                modified.push_str(&format!("line{}\n", i));
+            }
+        }
+        fs::write(root.join("file.txt"), &modified).unwrap();
+
+        let diff = compute_unified_diff(&root, &root.join("file.txt")).unwrap();
+
+        // With full context, distant changes should merge into a single hunk
+        let hunk_count = diff
+            .lines
+            .iter()
+            .filter(|l| matches!(l, UnifiedDiffLine::HunkHeader(_)))
+            .count();
+        assert_eq!(hunk_count, 1, "distant changes should be in one hunk with full context");
+
+        // All 18 unchanged lines should appear as context
+        let context_count = diff
+            .lines
+            .iter()
+            .filter(|l| matches!(l, UnifiedDiffLine::Context(_)))
+            .count();
+        assert_eq!(context_count, 18);
     }
 
     #[test]
