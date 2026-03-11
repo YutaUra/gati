@@ -53,6 +53,13 @@ impl CommentStore {
             .find(|c| c.file == file && line >= c.start_line && line <= c.end_line)
     }
 
+    /// Find a comment at the exact (start_line, end_line) range.
+    pub fn find_exact(&self, file: &Path, start_line: usize, end_line: usize) -> Option<&Comment> {
+        self.comments
+            .iter()
+            .find(|c| c.file == file && c.start_line == start_line && c.end_line == end_line)
+    }
+
     /// Delete a comment at the exact range.
     pub fn delete(&mut self, file: &Path, start_line: usize, end_line: usize) -> bool {
         let len_before = self.comments.len();
@@ -63,6 +70,7 @@ impl CommentStore {
     }
 
     /// Check if there are any comments.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.comments.is_empty()
     }

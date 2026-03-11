@@ -183,39 +183,56 @@ impl App {
             Action::StartComment => {
                 if let Some(file) = self.file_viewer.current_file() {
                     let file = file.to_path_buf();
-                    let line = self.file_viewer.cursor_line + 1; // 1-indexed
-                    // If existing comment on this line, pre-fill text
-                    let existing_text = self
-                        .comment_store
-                        .find_at_line(&file, line)
-                        .map(|c| c.text.clone())
-                        .unwrap_or_default();
-                    self.input_mode = InputMode::CommentInput {
-                        file,
-                        start_line: line,
-                        end_line: line,
-                        text: existing_text,
-                    };
+                    if let Some((start, end)) = self.file_viewer.cursor_on_comment {
+                        // Cursor is on a comment row → edit that specific comment
+                        let existing_text = self
+                            .comment_store
+                            .find_exact(&file, start, end)
+                            .map(|c| c.text.clone())
+                            .unwrap_or_default();
+                        self.input_mode = InputMode::CommentInput {
+                            file,
+                            start_line: start,
+                            end_line: end,
+                            text: existing_text,
+                        };
+                    } else if let Some(line) = self.file_viewer.cursor_file_line() {
+                        // Cursor is on a code line → always new comment
+                        self.input_mode = InputMode::CommentInput {
+                            file,
+                            start_line: line,
+                            end_line: line,
+                            text: String::new(),
+                        };
+                    }
+                    // If cursor_file_line() is None (Removed line in diff), do nothing
                 }
             }
             Action::StartLineSelect => {
                 if let Some(file) = self.file_viewer.current_file() {
-                    let file = file.to_path_buf();
-                    let line = self.file_viewer.cursor_line + 1; // 1-indexed
-                    self.input_mode = InputMode::LineSelect {
-                        file,
-                        anchor: line,
-                    };
+                    if let Some(line) = self.file_viewer.cursor_file_line() {
+                        let file = file.to_path_buf();
+                        self.input_mode = InputMode::LineSelect {
+                            file,
+                            anchor: line,
+                        };
+                    }
                 }
             }
             Action::DeleteComment => {
                 if let Some(file) = self.file_viewer.current_file() {
                     let file = file.to_path_buf();
-                    let line = self.file_viewer.cursor_line + 1;
-                    if let Some(comment) = self.comment_store.find_at_line(&file, line) {
-                        let start = comment.start_line;
-                        let end = comment.end_line;
+                    if let Some((start, end)) = self.file_viewer.cursor_on_comment {
+                        // Cursor is on a comment row → delete that specific comment
                         self.comment_store.delete(&file, start, end);
+                        self.file_viewer.cursor_on_comment = None;
+                    } else if let Some(line) = self.file_viewer.cursor_file_line() {
+                        // Cursor is on a code line → delete comment at that line
+                        if let Some(comment) = self.comment_store.find_at_line(&file, line) {
+                            let start = comment.start_line;
+                            let end = comment.end_line;
+                            self.comment_store.delete(&file, start, end);
+                        }
                     }
                 }
             }
@@ -423,13 +440,15 @@ fn handle_line_select(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         KeyCode::Char('c') => {
             // Open comment input for the selected range
             if let InputMode::LineSelect { ref file, anchor } = app.input_mode {
-                let current = app.file_viewer.cursor_line + 1; // 1-indexed
+                let current = app.file_viewer.cursor_file_line().unwrap_or(anchor);
                 let start = anchor.min(current);
                 let end = anchor.max(current);
                 let file = file.clone();
+                // Only pre-fill when editing the exact same range;
+                // overlapping or contained ranges should start empty.
                 let existing_text = app
                     .comment_store
-                    .find_at_line(&file, start)
+                    .find_exact(&file, start, end)
                     .map(|c| c.text.clone())
                     .unwrap_or_default();
                 app.input_mode = InputMode::CommentInput {
@@ -459,6 +478,17 @@ fn toggle_focus_mode(app: &mut App) {
         app.saved_tree_width_percent = app.tree_width_percent;
         app.focus_mode = true;
         app.focus = Focus::Viewer;
+    }
+}
+
+/// Enter LineSelect mode anchored at the current cursor position.
+/// Called on mouse-down in the viewer content area.
+fn start_mouse_line_select(app: &mut App) {
+    if let Some(file) = app.file_viewer.current_file() {
+        if let Some(line) = app.file_viewer.cursor_file_line() {
+            let file = file.to_path_buf();
+            app.input_mode = InputMode::LineSelect { file, anchor: line };
+        }
     }
 }
 
@@ -511,34 +541,49 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent, terminal_wid
                         .scroll_to_minimap_row(row_in_minimap, mr.height);
                 } else {
                     app.focus = Focus::Viewer;
+                    if app.file_viewer.click_line(mouse.row, mouse.column) {
+                        start_mouse_line_select(app);
+                    }
                 }
             } else {
                 app.focus = Focus::Viewer;
+                if app.file_viewer.click_line(mouse.row, mouse.column) {
+                    start_mouse_line_select(app);
+                }
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if !app.resizing {
-                return;
-            }
-            if app.focus_mode {
-                // Drag-to-restore: exit focus mode when dragged past min_cols
-                if mouse.column >= min_cols {
-                    app.focus_mode = false;
-                    app.tree_width_percent = clamp_tree_percent(mouse.column, terminal_width);
-                }
-            } else {
-                // Drag-to-collapse: enter focus mode when dragged below min_cols
-                if mouse.column < min_cols {
-                    app.saved_tree_width_percent = app.tree_width_percent;
-                    app.focus_mode = true;
-                    app.focus = Focus::Viewer;
+            if app.resizing {
+                if app.focus_mode {
+                    // Drag-to-restore: exit focus mode when dragged past min_cols
+                    if mouse.column >= min_cols {
+                        app.focus_mode = false;
+                        app.tree_width_percent = clamp_tree_percent(mouse.column, terminal_width);
+                    }
                 } else {
-                    app.tree_width_percent = clamp_tree_percent(mouse.column, terminal_width);
+                    // Drag-to-collapse: enter focus mode when dragged below min_cols
+                    if mouse.column < min_cols {
+                        app.saved_tree_width_percent = app.tree_width_percent;
+                        app.focus_mode = true;
+                        app.focus = Focus::Viewer;
+                    } else {
+                        app.tree_width_percent = clamp_tree_percent(mouse.column, terminal_width);
+                    }
                 }
+            } else if matches!(app.input_mode, InputMode::LineSelect { .. }) {
+                // Extend line selection by moving cursor to dragged row
+                app.file_viewer.click_line(mouse.row, mouse.column);
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
             app.resizing = false;
+            // If line-select range is a single line (no drag), cancel selection
+            if let InputMode::LineSelect { anchor, .. } = &app.input_mode {
+                let current = app.file_viewer.cursor_file_line().unwrap_or(*anchor);
+                if *anchor == current {
+                    app.input_mode = InputMode::Normal;
+                }
+            }
         }
         MouseEventKind::ScrollDown => {
             if app.focus_mode || mouse.column > app.border_column {
@@ -631,6 +676,32 @@ fn draw(frame: &mut Frame, app: &mut App) {
         app.file_viewer.comments.clear();
     }
 
+    // Pass inline comment editor state to file viewer
+    app.file_viewer.comment_edit = match &app.input_mode {
+        InputMode::CommentInput {
+            start_line, end_line, text, ..
+        } => Some(crate::file_viewer::CommentEditState {
+            start_line: *start_line,
+            target_line: *end_line,
+            text: text.clone(),
+        }),
+        _ => None,
+    };
+
+    // Pass line-select range to file viewer for V mode and comment input highlighting
+    app.file_viewer.line_select_range = match &app.input_mode {
+        InputMode::LineSelect { anchor, .. } => {
+            let cursor = app.file_viewer.cursor_file_line().unwrap_or(*anchor);
+            let start = (*anchor).min(cursor);
+            let end = (*anchor).max(cursor);
+            Some((start, end))
+        }
+        InputMode::CommentInput { start_line, end_line, .. } => {
+            Some((*start_line, *end_line))
+        }
+        _ => None,
+    };
+
     // Render panes
     let buf = frame.buffer_mut();
     app.file_tree
@@ -650,8 +721,13 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
     // Render key hint bar (or comment input)
     let hints: String = match &app.input_mode {
-        InputMode::CommentInput { text, .. } => {
-            format!("Comment: {}█  (Enter save  Esc cancel)", text)
+        InputMode::CommentInput { start_line, end_line, .. } => {
+            let range = if start_line == end_line {
+                format!("L{}", start_line)
+            } else {
+                format!("L{}-{}", start_line, end_line)
+            };
+            format!("Editing comment on {}  Enter save  Esc cancel", range)
         }
         InputMode::LineSelect { .. } => {
             "j/k extend  c comment  Esc cancel".into()
@@ -907,6 +983,66 @@ mod tests {
         app.handle_action(Action::DeleteComment);
 
         assert!(app.comment_store.is_empty());
+    }
+
+    #[test]
+    fn start_comment_on_comment_row_edits_existing() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let path = tmp.path().join("file.rs");
+        let mut app = App::new(&make_target(tmp.path(), Some(path.clone()))).unwrap();
+        app.comment_store.add(&path, 2, 4, "Existing comment".into());
+        app.focus = Focus::Viewer;
+        app.file_viewer.cursor_line = 3; // 0-indexed
+        app.file_viewer.cursor_on_comment = Some((2, 4));
+
+        app.handle_action(Action::StartComment);
+
+        match &app.input_mode {
+            InputMode::CommentInput { start_line, end_line, text, .. } => {
+                assert_eq!(*start_line, 2);
+                assert_eq!(*end_line, 4);
+                assert_eq!(text, "Existing comment");
+            }
+            other => panic!("Expected CommentInput, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn start_comment_on_code_line_creates_new() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let path = tmp.path().join("file.rs");
+        let mut app = App::new(&make_target(tmp.path(), Some(path.clone()))).unwrap();
+        // Add a range comment covering lines 1-5
+        app.comment_store.add(&path, 1, 5, "Range comment".into());
+        app.focus = Focus::Viewer;
+        app.file_viewer.cursor_line = 2; // 0-indexed, line 3 in 1-indexed (within range)
+        // cursor_on_comment is None → should create new, not edit existing
+
+        app.handle_action(Action::StartComment);
+
+        match &app.input_mode {
+            InputMode::CommentInput { start_line, end_line, text, .. } => {
+                assert_eq!(*start_line, 3); // cursor_line + 1
+                assert_eq!(*end_line, 3);
+                assert!(text.is_empty()); // new comment, not pre-filled
+            }
+            other => panic!("Expected CommentInput, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn delete_comment_on_comment_row_deletes_and_clears_focus() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let path = tmp.path().join("file.rs");
+        let mut app = App::new(&make_target(tmp.path(), Some(path.clone()))).unwrap();
+        app.comment_store.add(&path, 3, 5, "Delete me".into());
+        app.focus = Focus::Viewer;
+        app.file_viewer.cursor_on_comment = Some((3, 5));
+
+        app.handle_action(Action::DeleteComment);
+
+        assert!(app.comment_store.is_empty());
+        assert!(app.file_viewer.cursor_on_comment.is_none());
     }
 
     #[test]
@@ -1434,6 +1570,135 @@ mod tests {
         handle_mouse(&mut app, ev, 100);
 
         assert_eq!(app.focus, Focus::Tree); // unchanged
+    }
+
+    // Mouse drag line selection
+    #[test]
+    fn mouse_click_on_viewer_enters_line_select() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let file_path = tmp.path().join("file.rs");
+        fs::write(&file_path, "line0\nline1\nline2\nline3\nline4\n").unwrap();
+        let mut app = App::new(&make_target(tmp.path(), Some(file_path.clone()))).unwrap();
+        app.border_column = 30;
+        // Simulate content_rect as if viewer rendered at (31, 1) with 69x20
+        app.file_viewer.content_rect = Some(ratatui::layout::Rect::new(31, 1, 69, 20));
+        app.file_viewer.scroll_offset = 0;
+
+        // Click on viewer row 3 → inner row 2 → cursor_line = 2, file_line = 3
+        let down = make_mouse_event_at(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            40, 3,
+        );
+        handle_mouse(&mut app, down, 100);
+
+        assert_eq!(app.focus, Focus::Viewer);
+        assert_eq!(app.file_viewer.cursor_line, 2);
+        match &app.input_mode {
+            InputMode::LineSelect { anchor, .. } => assert_eq!(*anchor, 3),
+            other => panic!("Expected LineSelect, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mouse_drag_extends_line_select() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let file_path = tmp.path().join("file.rs");
+        fs::write(&file_path, "line0\nline1\nline2\nline3\nline4\n").unwrap();
+        let mut app = App::new(&make_target(tmp.path(), Some(file_path.clone()))).unwrap();
+        app.border_column = 30;
+        app.file_viewer.content_rect = Some(ratatui::layout::Rect::new(31, 1, 69, 20));
+        app.file_viewer.scroll_offset = 0;
+
+        // Mouse down at row 2 → cursor_line = 1, anchor = file_line 2
+        let down = make_mouse_event_at(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            40, 2,
+        );
+        handle_mouse(&mut app, down, 100);
+        assert!(matches!(app.input_mode, InputMode::LineSelect { .. }));
+
+        // Drag to row 5 → cursor_line = 4, file_line = 5
+        let drag = make_mouse_event_at(
+            crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            40, 5,
+        );
+        handle_mouse(&mut app, drag, 100);
+
+        assert_eq!(app.file_viewer.cursor_line, 4);
+        // Still in LineSelect mode
+        match &app.input_mode {
+            InputMode::LineSelect { anchor, .. } => assert_eq!(*anchor, 2),
+            other => panic!("Expected LineSelect after drag, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mouse_up_single_line_cancels_line_select() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let file_path = tmp.path().join("file.rs");
+        fs::write(&file_path, "line0\nline1\nline2\n").unwrap();
+        let mut app = App::new(&make_target(tmp.path(), Some(file_path.clone()))).unwrap();
+        app.border_column = 30;
+        app.file_viewer.content_rect = Some(ratatui::layout::Rect::new(31, 1, 69, 20));
+        app.file_viewer.scroll_offset = 0;
+
+        // Click (no drag) → down + up on same row
+        let down = make_mouse_event_at(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            40, 2,
+        );
+        handle_mouse(&mut app, down, 100);
+        assert!(matches!(app.input_mode, InputMode::LineSelect { .. }));
+
+        let up = make_mouse_event_at(
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            40, 2,
+        );
+        handle_mouse(&mut app, up, 100);
+
+        // Single-line select cancelled on mouse up
+        assert!(matches!(app.input_mode, InputMode::Normal));
+    }
+
+    #[test]
+    fn mouse_up_multi_line_keeps_line_select() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let file_path = tmp.path().join("file.rs");
+        fs::write(&file_path, "line0\nline1\nline2\nline3\n").unwrap();
+        let mut app = App::new(&make_target(tmp.path(), Some(file_path.clone()))).unwrap();
+        app.border_column = 30;
+        app.file_viewer.content_rect = Some(ratatui::layout::Rect::new(31, 1, 69, 20));
+        app.file_viewer.scroll_offset = 0;
+
+        // Down at row 2
+        let down = make_mouse_event_at(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            40, 2,
+        );
+        handle_mouse(&mut app, down, 100);
+
+        // Drag to row 4
+        let drag = make_mouse_event_at(
+            crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            40, 4,
+        );
+        handle_mouse(&mut app, drag, 100);
+
+        // Up → multi-line selection should persist
+        let up = make_mouse_event_at(
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            40, 4,
+        );
+        handle_mouse(&mut app, up, 100);
+
+        match &app.input_mode {
+            InputMode::LineSelect { anchor, .. } => {
+                assert_eq!(*anchor, 2); // anchor at file line 2
+                let current = app.file_viewer.cursor_file_line().unwrap();
+                assert_eq!(current, 4); // cursor at file line 4
+            }
+            other => panic!("Expected LineSelect to persist after multi-line drag, got {:?}", other),
+        }
     }
 
     // Git diff refresh on filesystem change

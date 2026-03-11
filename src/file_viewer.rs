@@ -61,6 +61,16 @@ pub enum ViewerContent {
     Error(String),
 }
 
+/// Active inline comment editor state, passed from App before each render.
+pub struct CommentEditState {
+    /// Start of the comment range (1-indexed).
+    pub start_line: usize,
+    /// End of the comment range (1-indexed). The editor renders below this line.
+    pub target_line: usize,
+    /// Current text being edited.
+    pub text: String,
+}
+
 pub struct FileViewer {
     pub content: ViewerContent,
     pub scroll_offset: usize,
@@ -93,6 +103,19 @@ pub struct FileViewer {
     pub comments: Vec<Comment>,
     /// Cached minimap rectangle from the last render (for mouse hit-testing).
     pub minimap_rect: Option<Rect>,
+    /// Inline comment editor state (set by App before render, cleared after).
+    pub comment_edit: Option<CommentEditState>,
+    /// Line-select range for V mode highlighting (1-indexed start, end).
+    /// Set by App before render when in LineSelect mode, cleared otherwise.
+    pub line_select_range: Option<(usize, usize)>,
+    /// When Some, the cursor is on a comment row identified by (start_line, end_line).
+    /// cursor_line stays at end_line - 1 (0-indexed) so the comment renders just below it.
+    pub cursor_on_comment: Option<(usize, usize)>,
+    /// Mapping from diff display index → file line number (1-indexed).
+    /// `None` for Removed lines (not in current file), `Some(n)` for Context/Added.
+    pub diff_line_numbers: Vec<Option<usize>>,
+    /// Cached content area rectangle from the last render (for mouse hit-testing).
+    pub content_rect: Option<Rect>,
 }
 
 impl FileViewer {
@@ -114,6 +137,11 @@ impl FileViewer {
             diff_mode: false,
             comments: Vec::new(),
             minimap_rect: None,
+            comment_edit: None,
+            line_select_range: None,
+            cursor_on_comment: None,
+            diff_line_numbers: Vec::new(),
+            content_rect: None,
         }
     }
 
@@ -126,6 +154,7 @@ impl FileViewer {
         self.line_diff = line_diff;
         self.diff_highlighted_lines.clear();
         self.unified_diff = unified_diff;
+        self.compute_diff_line_numbers();
     }
 
     /// Lazily compute syntax-highlighted spans for unified diff lines.
@@ -229,6 +258,7 @@ impl FileViewer {
         self.scroll_offset = 0;
         self.cursor_line = 0;
         self.h_scroll = 0;
+        self.cursor_on_comment = None;
         self.diff_mode = false;
         self.line_diff = None;
         self.unified_diff = None;
@@ -236,6 +266,7 @@ impl FileViewer {
         self.hl_parse_state = None;
         self.hl_highlight_state = None;
         self.diff_highlighted_lines.clear();
+        self.diff_line_numbers.clear();
 
         // Try to read the file
         let bytes = match std::fs::read(path) {
@@ -294,6 +325,96 @@ impl FileViewer {
         match &self.content {
             ViewerContent::File { lines, .. } => lines.len(),
             _ => 0,
+        }
+    }
+
+    /// Build the mapping from diff display index to file line number.
+    /// Context/Added lines get `Some(line_number)` (1-indexed);
+    /// Removed lines get `None` (not present in the current file).
+    fn compute_diff_line_numbers(&mut self) {
+        self.diff_line_numbers.clear();
+        let Some(ref diff) = self.unified_diff else {
+            return;
+        };
+        let mut new_lineno: usize = 0;
+        for line in &diff.lines {
+            match line {
+                UnifiedDiffLine::HunkHeader(_) => {}
+                UnifiedDiffLine::Context(_) | UnifiedDiffLine::Added(_) => {
+                    new_lineno += 1;
+                    self.diff_line_numbers.push(Some(new_lineno));
+                }
+                UnifiedDiffLine::Removed(_) => {
+                    self.diff_line_numbers.push(None);
+                }
+            }
+        }
+    }
+
+    /// Return the 1-indexed file line number at the current cursor position.
+    /// In normal mode: `cursor_line + 1`. In diff mode: looked up from
+    /// `diff_line_numbers` (None for Removed lines).
+    pub fn cursor_file_line(&self) -> Option<usize> {
+        if self.diff_mode {
+            self.diff_line_numbers.get(self.cursor_line).copied().flatten()
+        } else {
+            Some(self.cursor_line + 1)
+        }
+    }
+
+    /// Resolve the file line at the current cursor, falling back to the
+    /// nearest file line when sitting on a Removed line in diff mode.
+    /// Searches downward first (Removed→Added is the natural pair), then up.
+    fn resolve_nearest_file_line(&self) -> Option<usize> {
+        if let Some(fl) = self.cursor_file_line() {
+            return Some(fl);
+        }
+        // On a Removed line in diff mode – scan neighbours
+        let len = self.diff_line_numbers.len();
+        // Down first (Added lines typically follow Removed lines)
+        for i in (self.cursor_line + 1)..len {
+            if let Some(Some(fl)) = self.diff_line_numbers.get(i) {
+                return Some(*fl);
+            }
+        }
+        // Then up
+        for i in (0..self.cursor_line).rev() {
+            if let Some(Some(fl)) = self.diff_line_numbers.get(i) {
+                return Some(*fl);
+            }
+        }
+        None
+    }
+
+    /// Reverse lookup: given a 1-indexed file line number, find the diff
+    /// display index that maps to it. Returns the exact match or the closest
+    /// display index if no exact match exists.
+    fn diff_display_index_for_file_line(&self, file_line: usize) -> usize {
+        // Exact match
+        if let Some(pos) = self.diff_line_numbers.iter().position(|n| *n == Some(file_line)) {
+            return pos;
+        }
+        // Closest: find the entry with the smallest distance
+        let mut best_idx = 0;
+        let mut best_dist = usize::MAX;
+        for (i, n) in self.diff_line_numbers.iter().enumerate() {
+            if let Some(fl) = n {
+                let dist = (*fl as isize - file_line as isize).unsigned_abs();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_idx = i;
+                }
+            }
+        }
+        best_idx
+    }
+
+    /// Like `cursor_file_line` but for an arbitrary cursor position.
+    fn effective_file_line(&self, cursor: usize) -> Option<usize> {
+        if self.diff_mode {
+            self.diff_line_numbers.get(cursor).copied().flatten()
+        } else {
+            Some(cursor + 1)
         }
     }
 
@@ -390,6 +511,24 @@ impl FileViewer {
         (row as usize * total / minimap_height as usize).min(total.saturating_sub(1))
     }
 
+    /// Move the cursor to the line at the given terminal coordinates.
+    /// Returns true if the click was within the content area and cursor was moved.
+    pub fn click_line(&mut self, row: u16, column: u16) -> bool {
+        let cr = match self.content_rect {
+            Some(r) => r,
+            None => return false,
+        };
+        if row < cr.y || row >= cr.y + cr.height || column < cr.x || column >= cr.x + cr.width {
+            return false;
+        }
+        let inner_row = (row - cr.y) as usize;
+        let target = self.scroll_offset + inner_row;
+        let max = self.total_lines().saturating_sub(1);
+        self.cursor_line = target.min(max);
+        self.cursor_on_comment = None;
+        true
+    }
+
     /// Scroll so that the line corresponding to a minimap row is centered in the viewport.
     pub fn scroll_to_minimap_row(&mut self, row: u16, minimap_height: u16) {
         let line = self.minimap_row_to_line(row, minimap_height);
@@ -397,6 +536,7 @@ impl FileViewer {
         self.scroll_offset = line.saturating_sub(half);
         self.scroll_offset = self.scroll_offset.min(self.max_scroll());
         self.cursor_line = line;
+        self.cursor_on_comment = None;
     }
 
     fn max_scroll(&self) -> usize {
@@ -463,6 +603,7 @@ impl FileViewer {
             (inner, None)
         };
         self.minimap_rect = minimap_area;
+        self.content_rect = Some(content_area);
 
         self.visible_height = content_area.height as usize;
 
@@ -505,6 +646,20 @@ impl FileViewer {
                     ViewerContent::File { lines, .. } => lines.len(),
                     _ => 0,
                 };
+
+                // Auto-scroll to keep inline comment editor visible.
+                // The editor renders below the target line, so we need
+                // target_line (0-indexed) + 2 extra rows to be in viewport.
+                if let Some(ref edit) = self.comment_edit {
+                    let target_idx = edit.target_line.saturating_sub(1); // 0-indexed
+                    let editor_rows = 2; // editor + separator
+                    let need_visible = target_idx + 1 + editor_rows;
+                    let vh = content_area.height as usize;
+                    if need_visible > self.scroll_offset + vh {
+                        self.scroll_offset = need_visible.saturating_sub(vh);
+                    }
+                }
+
                 // Incrementally compute highlights up to the last visible line.
                 let need_up_to = (self.scroll_offset + content_area.height as usize).min(line_count);
                 self.ensure_highlighted_up_to(need_up_to);
@@ -569,22 +724,69 @@ impl FileViewer {
                     let y = content_area.y + render_row;
                     buf.set_line(content_area.x, y, &line, content_area.width);
 
-                    // Highlight cursor line with subtle background
-                    if focused && code_line_idx == self.cursor_line {
+                    // Determine background highlight for this line
+                    let in_line_select = self.line_select_range.map_or(false, |(s, e)| {
+                        line_num >= s && line_num <= e
+                    });
+                    let in_comment_range = self
+                        .comments
+                        .iter()
+                        .any(|c| line_num >= c.start_line && line_num <= c.end_line);
+
+                    let highlight_bg = if focused && code_line_idx == self.cursor_line && self.cursor_on_comment.is_none() {
+                        Some(Color::DarkGray)
+                    } else if in_line_select {
+                        Some(Color::DarkGray)
+                    } else if in_comment_range {
+                        Some(Color::Indexed(236)) // subtle dark bg (#303030)
+                    } else {
+                        None
+                    };
+                    if let Some(bg) = highlight_bg {
                         for x in content_area.x..content_area.x + content_area.width {
                             let cell = &mut buf[(x, y)];
-                            cell.set_bg(Color::DarkGray);
+                            cell.set_bg(bg);
+                            // Keep line numbers readable on dark background
+                            if in_comment_range && cell.fg == Color::DarkGray {
+                                cell.set_fg(Color::Gray);
+                            }
                         }
                     }
 
                     render_row += 1;
 
-                    // Render inline comment block after this line if applicable
-                    if let Some(comment) = self.comment_at_end_line(line_num) {
+                    // Render inline comment editor or existing comment block
+                    let editing_this_line = self
+                        .comment_edit
+                        .as_ref()
+                        .map_or(false, |e| e.target_line == line_num);
+
+                    if editing_this_line {
+                        // Inline editor takes priority over saved comment
+                        if let Some(ref edit) = self.comment_edit {
+                            self.render_comment_editor(
+                                edit, content_area, buf, &mut render_row, max_rows,
+                            );
+                        }
+                    } else if let Some(comment) = self.comment_at_end_line(line_num) {
                         if render_row < max_rows {
+                            // Check if cursor is on this comment row
+                            let cursor_on_this = focused && self.cursor_on_comment
+                                .map_or(false, |(s, e)| s == comment.start_line && e == comment.end_line);
+                            let comment_render_start = render_row;
                             self.render_comment_block(
                                 comment, content_area, buf, &mut render_row, max_rows,
                             );
+                            // Highlight all rows of the comment block when cursor is on it
+                            if cursor_on_this {
+                                for r in comment_render_start..render_row {
+                                    let y = content_area.y + r;
+                                    for x in content_area.x..content_area.x + content_area.width {
+                                        let cell = &mut buf[(x, y)];
+                                        cell.set_bg(Color::DarkGray);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -629,6 +831,59 @@ impl FileViewer {
         *render_row += 1;
 
         // Row 2: separator line
+        if *render_row < max_rows {
+            let y = inner.y + *render_row;
+            let sep = "─".repeat(inner.width as usize);
+            let line = Line::from(Span::styled(sep, Style::default().fg(Color::DarkGray)));
+            buf.set_line(inner.x, y, &line, inner.width);
+            *render_row += 1;
+        }
+    }
+
+    /// Render the inline comment editor (single row: prefix + text + cursor).
+    ///
+    /// If the text is wider than the available space, truncate from the left
+    /// so the cursor end is always visible.
+    fn render_comment_editor(
+        &self,
+        edit: &CommentEditState,
+        inner: Rect,
+        buf: &mut Buffer,
+        render_row: &mut u16,
+        max_rows: u16,
+    ) {
+        if *render_row >= max_rows {
+            return;
+        }
+        let style = Style::default().fg(Color::Cyan).bg(Color::Black);
+        let range = if edit.start_line == edit.target_line {
+            format!("L{}", edit.target_line)
+        } else {
+            format!("L{}-{}", edit.start_line, edit.target_line)
+        };
+        let prefix = format!("  ✏️ {}: ", range);
+        let prefix_width = prefix.chars().count();
+        let available = (inner.width as usize).saturating_sub(prefix_width + 1); // +1 for cursor
+
+        // Truncate text from the left if it exceeds available width
+        let display_text = if edit.text.len() > available {
+            &edit.text[edit.text.len() - available..]
+        } else {
+            &edit.text
+        };
+
+        let content = format!("{prefix}{display_text}█");
+        let y = inner.y + *render_row;
+        let line = Line::from(Span::styled(&content, style));
+        buf.set_line(inner.x, y, &line, inner.width);
+        // Fill background for entire row
+        for x in inner.x..inner.x + inner.width {
+            let cell = &mut buf[(x, y)];
+            cell.set_bg(Color::Black);
+        }
+        *render_row += 1;
+
+        // Separator line
         if *render_row < max_rows {
             let y = inner.y + *render_row;
             let sep = "─".repeat(inner.width as usize);
@@ -724,7 +979,7 @@ impl FileViewer {
         }
     }
 
-    /// Render unified diff content with language syntax highlighting.
+    /// Render unified diff content with language syntax highlighting and inline comments.
     fn render_diff_mode(&mut self, inner: Rect, buf: &mut Buffer) {
         self.ensure_diff_highlighted();
         let Some(ref diff) = self.unified_diff else {
@@ -759,30 +1014,30 @@ impl FileViewer {
         };
         let gutter_width = line_number_width(file_line_count);
 
-        // Track new-file line number (increments for Context and Added, not for Removed)
-        let mut new_lineno: usize = 0;
-        // Pre-compute line numbers for all displayable lines
-        let line_numbers: Vec<Option<usize>> = displayable.iter().map(|(_, l)| {
-            match l {
-                UnifiedDiffLine::Context(_) | UnifiedDiffLine::Added(_) => {
-                    new_lineno += 1;
-                    Some(new_lineno)
-                }
-                _ => None,
+        // Auto-scroll to keep inline comment editor visible in diff mode.
+        if let Some(ref edit) = self.comment_edit {
+            let target_idx = edit.target_line.saturating_sub(1); // 0-indexed
+            let editor_rows = 2; // editor + separator
+            let need_visible = target_idx + 1 + editor_rows;
+            let vh = inner.height as usize;
+            if need_visible > self.scroll_offset + vh {
+                self.scroll_offset = need_visible.saturating_sub(vh);
             }
-        }).collect();
+        }
 
-        for (render_idx, (disp_idx, (orig_idx, diff_line))) in displayable
+        let mut render_row: u16 = 0;
+        let max_rows = inner.height;
+
+        for (disp_idx, (orig_idx, diff_line)) in displayable
             .iter()
             .enumerate()
             .skip(self.scroll_offset)
-            .take(self.visible_height)
-            .enumerate()
         {
-            let y = inner.y + render_idx as u16;
-            if y >= inner.y + inner.height {
+            if render_row >= max_rows {
                 break;
             }
+
+            let y = inner.y + render_row;
 
             // Prefix (+/-/space) in the same column as the diff marker (▎) in preview mode
             let prefix = match diff_line {
@@ -797,7 +1052,7 @@ impl FileViewer {
             };
 
             // Line number gutter (same position as preview mode)
-            let num_str = match line_numbers[disp_idx] {
+            let num_str = match self.diff_line_numbers.get(disp_idx).copied().flatten() {
                 Some(n) => format!("{:>width$} ", n, width = gutter_width),
                 None => format!("{:>width$} ", "", width = gutter_width),
             };
@@ -825,40 +1080,132 @@ impl FileViewer {
             let line = Line::from(spans);
             buf.set_line(inner.x, y, &line, inner.width);
 
-            // Apply background tint for added/removed lines
+            // Cursor highlight for code line
+            let is_cursor_line = disp_idx == self.cursor_line && self.cursor_on_comment.is_none();
+            let file_ln = self.diff_line_numbers.get(disp_idx).copied().flatten();
+
+            // Apply background tint for added/removed lines and cursor
             match diff_line {
                 UnifiedDiffLine::Added(_) => {
+                    let bg = if is_cursor_line { Color::DarkGray } else { Color::Rgb(0, 40, 0) };
                     for x in inner.x..inner.x + inner.width {
                         let cell = &mut buf[(x, y)];
-                        cell.set_bg(Color::Rgb(0, 40, 0));
+                        cell.set_bg(bg);
                     }
                 }
                 UnifiedDiffLine::Removed(_) => {
+                    let bg = if is_cursor_line { Color::DarkGray } else { Color::Rgb(40, 0, 0) };
                     for x in inner.x..inner.x + inner.width {
                         let cell = &mut buf[(x, y)];
-                        cell.set_bg(Color::Rgb(40, 0, 0));
+                        cell.set_bg(bg);
                     }
                 }
-                _ => {}
+                _ => {
+                    if is_cursor_line {
+                        for x in inner.x..inner.x + inner.width {
+                            let cell = &mut buf[(x, y)];
+                            cell.set_bg(Color::DarkGray);
+                        }
+                    }
+                }
+            }
+
+            render_row += 1;
+
+            // Render inline comment editor or existing comment block after this line
+            if let Some(ln) = file_ln {
+                let editing_this_line = self
+                    .comment_edit
+                    .as_ref()
+                    .map_or(false, |e| e.target_line == ln);
+
+                if editing_this_line {
+                    if let Some(ref edit) = self.comment_edit {
+                        self.render_comment_editor(
+                            edit, inner, buf, &mut render_row, max_rows,
+                        );
+                    }
+                } else if let Some(comment) = self.comment_at_end_line(ln) {
+                    if render_row < max_rows {
+                        let cursor_on_this = self.cursor_on_comment
+                            .map_or(false, |(s, e)| s == comment.start_line && e == comment.end_line);
+                        let comment_render_start = render_row;
+                        self.render_comment_block(
+                            comment, inner, buf, &mut render_row, max_rows,
+                        );
+                        if cursor_on_this {
+                            for r in comment_render_start..render_row {
+                                let cy = inner.y + r;
+                                for x in inner.x..inner.x + inner.width {
+                                    let cell = &mut buf[(x, cy)];
+                                    cell.set_bg(Color::DarkGray);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
     /// Move cursor down by one line, auto-scrolling viewport if needed.
+    /// Stops on comment rows that appear between code lines.
     pub fn cursor_down(&mut self) {
         let max = self.total_lines().saturating_sub(1);
-        if self.cursor_line < max {
-            self.cursor_line += 1;
-            self.ensure_cursor_visible();
+        if self.cursor_on_comment.is_some() {
+            // Currently on a comment row → move to the next code line
+            self.cursor_on_comment = None;
+            if self.cursor_line < max {
+                self.cursor_line += 1;
+            }
+        } else if self.cursor_line < max {
+            // Check if there is a comment ending at the current file line.
+            // If so, stop on the comment row instead of advancing cursor_line.
+            if let Some(ln) = self.effective_file_line(self.cursor_line) {
+                if let Some(c) = self.comment_at_end_line(ln) {
+                    self.cursor_on_comment = Some((c.start_line, c.end_line));
+                } else {
+                    self.cursor_line += 1;
+                }
+            } else {
+                // Removed line in diff mode — no comment possible, just advance
+                self.cursor_line += 1;
+            }
         }
+        self.ensure_cursor_visible();
     }
 
     /// Move cursor up by one line, auto-scrolling viewport if needed.
+    /// Stops on comment rows that appear between code lines.
     pub fn cursor_up(&mut self) {
-        if self.cursor_line > 0 {
-            self.cursor_line -= 1;
-            self.ensure_cursor_visible();
+        if self.cursor_on_comment.is_some() {
+            // Currently on a comment row → move up to the code line above (cursor_line stays)
+            self.cursor_on_comment = None;
+            // cursor_line is already at the code line just above the comment
+        } else if self.cursor_line > 0 {
+            // Check the line above for a comment.
+            // In normal mode: comment_at_end_line(cursor_line) checks the line above.
+            // In diff mode: use the file line number of cursor_line - 1.
+            let check_line = if self.diff_mode {
+                // Look at the previous display line's file line number
+                self.effective_file_line(self.cursor_line.saturating_sub(1))
+            } else {
+                // cursor_line is 0-indexed, so cursor_line gives 1-indexed line above
+                Some(self.cursor_line)
+            };
+            if let Some(ln) = check_line {
+                if let Some(c) = self.comment_at_end_line(ln) {
+                    self.cursor_on_comment = Some((c.start_line, c.end_line));
+                    self.cursor_line -= 1;
+                } else {
+                    self.cursor_line -= 1;
+                }
+            } else {
+                // Removed line — just move up
+                self.cursor_line -= 1;
+            }
         }
+        self.ensure_cursor_visible();
     }
 
     /// Get the path of the currently loaded file, if any.
@@ -897,9 +1244,39 @@ impl Component for FileViewer {
             (KeyCode::Char('d'), KeyModifiers::NONE) => {
                 // Toggle diff mode (only when unified diff data is available)
                 if self.unified_diff.is_some() {
+                    // 1. Remember the file line and viewport-relative position
+                    let file_line = self.resolve_nearest_file_line();
+                    let screen_row = self.cursor_line.saturating_sub(self.scroll_offset);
+
+                    // 2. Toggle mode
                     self.diff_mode = !self.diff_mode;
-                    self.scroll_offset = 0;
-                    self.cursor_line = 0;
+                    self.cursor_on_comment = None;
+                    if self.diff_mode {
+                        self.compute_diff_line_numbers();
+                    }
+
+                    // 3. Map the saved file line to the new mode's index
+                    if let Some(fl) = file_line {
+                        self.cursor_line = if self.diff_mode {
+                            self.diff_display_index_for_file_line(fl)
+                        } else {
+                            fl.saturating_sub(1) // 1-indexed → 0-indexed
+                        };
+                        // Clamp cursor to valid range
+                        let max_line = self.total_lines().saturating_sub(1);
+                        self.cursor_line = self.cursor_line.min(max_line);
+
+                        // 4. Restore viewport-relative position
+                        self.scroll_offset = self.cursor_line.saturating_sub(screen_row);
+                        let max_s = self.max_scroll();
+                        if self.scroll_offset > max_s {
+                            self.scroll_offset = max_s;
+                        }
+                    } else {
+                        // No file line found (empty diff) – reset
+                        self.scroll_offset = 0;
+                        self.cursor_line = 0;
+                    }
                 }
                 Ok(Action::None)
             }
@@ -917,6 +1294,7 @@ impl Component for FileViewer {
                 // Move cursor with the scroll
                 let max = self.total_lines().saturating_sub(1);
                 self.cursor_line = (self.cursor_line + half).min(max);
+                self.cursor_on_comment = None;
                 self.ensure_cursor_visible();
                 Ok(Action::None)
             }
@@ -925,6 +1303,7 @@ impl Component for FileViewer {
                 self.scroll_up(half);
                 // Move cursor with the scroll
                 self.cursor_line = self.cursor_line.saturating_sub(half);
+                self.cursor_on_comment = None;
                 self.ensure_cursor_visible();
                 Ok(Action::None)
             }
@@ -1758,6 +2137,537 @@ mod tests {
         viewer.load_file(&path);
         viewer.handle_event(key(KeyCode::Right)).unwrap();
         assert_eq!(viewer.h_scroll, H_SCROLL_AMOUNT);
+    }
+
+    // Comment navigation tests
+    fn make_comment(path: &Path, start: usize, end: usize) -> Comment {
+        Comment {
+            file: path.to_path_buf(),
+            start_line: start,
+            end_line: end,
+            text: "test comment".into(),
+        }
+    }
+
+    #[test]
+    fn cursor_down_stops_on_comment_row() {
+        let content: Vec<u8> = (0..10).map(|i| format!("line {i}\n")).collect::<String>().into();
+        let (_tmp, path) = tmp_file("test.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        // Add comment ending at line 3 (1-indexed)
+        viewer.comments = vec![make_comment(&path, 3, 3)];
+        viewer.cursor_line = 1; // 0-indexed, line 2 in 1-indexed
+
+        // Move down: cursor_line is 1, comment ends at line 2 (cursor_line+1=2, but
+        // comment_at_end_line checks cursor_line+1 in 1-indexed which is 2... let's think:
+        // cursor_line=1 → current 1-indexed line is 2. Next 1-indexed line would be 3.
+        // comment_at_end_line(cursor_line+1) = comment_at_end_line(2) → no match (comment end_line=3)
+        // So cursor moves to cursor_line=2.
+        viewer.cursor_down();
+        assert_eq!(viewer.cursor_line, 2);
+        assert!(viewer.cursor_on_comment.is_none());
+
+        // Move down again: cursor_line=2 → comment_at_end_line(cursor_line+1=3) → match!
+        viewer.cursor_down();
+        assert_eq!(viewer.cursor_line, 2); // stays on code line above comment
+        assert_eq!(viewer.cursor_on_comment, Some((3, 3)));
+    }
+
+    #[test]
+    fn cursor_down_from_comment_moves_to_next_code_line() {
+        let content: Vec<u8> = (0..10).map(|i| format!("line {i}\n")).collect::<String>().into();
+        let (_tmp, path) = tmp_file("test.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.comments = vec![make_comment(&path, 3, 3)];
+        viewer.cursor_line = 2; // 0-indexed
+        viewer.cursor_on_comment = Some((3, 3));
+
+        // Move down from comment → next code line
+        viewer.cursor_down();
+        assert!(viewer.cursor_on_comment.is_none());
+        assert_eq!(viewer.cursor_line, 3); // 0-indexed, line 4 in 1-indexed
+    }
+
+    #[test]
+    fn cursor_up_stops_on_comment_row() {
+        let content: Vec<u8> = (0..10).map(|i| format!("line {i}\n")).collect::<String>().into();
+        let (_tmp, path) = tmp_file("test.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.comments = vec![make_comment(&path, 3, 3)];
+        viewer.cursor_line = 3; // 0-indexed, line 4 in 1-indexed
+
+        // Move up: comment_at_end_line(cursor_line=3) → match (comment end_line=3)
+        viewer.cursor_up();
+        assert_eq!(viewer.cursor_line, 2);
+        assert_eq!(viewer.cursor_on_comment, Some((3, 3)));
+    }
+
+    #[test]
+    fn cursor_up_from_comment_moves_to_code_line_above() {
+        let content: Vec<u8> = (0..10).map(|i| format!("line {i}\n")).collect::<String>().into();
+        let (_tmp, path) = tmp_file("test.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.comments = vec![make_comment(&path, 3, 3)];
+        viewer.cursor_line = 2;
+        viewer.cursor_on_comment = Some((3, 3));
+
+        // Move up from comment → code line above (cursor_line stays at 2)
+        viewer.cursor_up();
+        assert!(viewer.cursor_on_comment.is_none());
+        assert_eq!(viewer.cursor_line, 2);
+    }
+
+    #[test]
+    fn ctrl_d_clears_cursor_on_comment() {
+        let content: Vec<u8> = (0..100).map(|i| format!("line {i}\n")).collect::<String>().into();
+        let (_tmp, path) = tmp_file("long.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.visible_height = 20;
+        viewer.load_file(&path);
+        viewer.cursor_on_comment = Some((3, 3));
+
+        viewer.handle_event(ctrl_key('d')).unwrap();
+        assert!(viewer.cursor_on_comment.is_none());
+    }
+
+    #[test]
+    fn ctrl_u_clears_cursor_on_comment() {
+        let content: Vec<u8> = (0..100).map(|i| format!("line {i}\n")).collect::<String>().into();
+        let (_tmp, path) = tmp_file("long.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.visible_height = 20;
+        viewer.load_file(&path);
+        viewer.cursor_line = 30;
+        viewer.scroll_offset = 20;
+        viewer.cursor_on_comment = Some((25, 25));
+
+        viewer.handle_event(ctrl_key('u')).unwrap();
+        assert!(viewer.cursor_on_comment.is_none());
+    }
+
+    #[test]
+    fn load_file_clears_cursor_on_comment() {
+        let (_tmp, path) = tmp_file("test.txt", b"line1\nline2");
+        let mut viewer = FileViewer::new();
+        viewer.cursor_on_comment = Some((1, 1));
+        viewer.load_file(&path);
+        assert!(viewer.cursor_on_comment.is_none());
+    }
+
+    // ── diff_line_numbers / cursor_file_line tests ──
+
+    fn make_diff_viewer(diff_lines: Vec<UnifiedDiffLine>) -> FileViewer {
+        let mut viewer = FileViewer::new();
+        let diff = UnifiedDiff { lines: diff_lines };
+        viewer.unified_diff = Some(diff);
+        viewer.compute_diff_line_numbers();
+        viewer
+    }
+
+    #[test]
+    fn compute_diff_line_numbers_context_added_removed() {
+        let viewer = make_diff_viewer(vec![
+            UnifiedDiffLine::Context("ctx1".into()),  // file line 1
+            UnifiedDiffLine::Removed("old".into()),   // None
+            UnifiedDiffLine::Added("new".into()),      // file line 2
+            UnifiedDiffLine::Context("ctx2".into()),  // file line 3
+        ]);
+        assert_eq!(
+            viewer.diff_line_numbers,
+            vec![Some(1), None, Some(2), Some(3)]
+        );
+    }
+
+    #[test]
+    fn compute_diff_line_numbers_skips_hunk_headers() {
+        let viewer = make_diff_viewer(vec![
+            UnifiedDiffLine::HunkHeader("@@ ... @@".into()),
+            UnifiedDiffLine::Context("a".into()),
+            UnifiedDiffLine::Added("b".into()),
+        ]);
+        // HunkHeader should not appear in diff_line_numbers
+        assert_eq!(viewer.diff_line_numbers, vec![Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn cursor_file_line_normal_mode() {
+        let content: Vec<u8> = (0..5).map(|i| format!("line {i}\n")).collect::<String>().into();
+        let (_tmp, path) = tmp_file("test.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.cursor_line = 0;
+        assert_eq!(viewer.cursor_file_line(), Some(1));
+        viewer.cursor_line = 3;
+        assert_eq!(viewer.cursor_file_line(), Some(4));
+    }
+
+    #[test]
+    fn cursor_file_line_diff_mode_context_line() {
+        let mut viewer = make_diff_viewer(vec![
+            UnifiedDiffLine::Context("a".into()),
+            UnifiedDiffLine::Added("b".into()),
+            UnifiedDiffLine::Removed("c".into()),
+        ]);
+        viewer.diff_mode = true;
+        viewer.cursor_line = 0;
+        assert_eq!(viewer.cursor_file_line(), Some(1));
+        viewer.cursor_line = 1;
+        assert_eq!(viewer.cursor_file_line(), Some(2));
+    }
+
+    #[test]
+    fn cursor_file_line_diff_mode_removed_line_is_none() {
+        let mut viewer = make_diff_viewer(vec![
+            UnifiedDiffLine::Context("a".into()),
+            UnifiedDiffLine::Removed("old".into()),
+            UnifiedDiffLine::Added("new".into()),
+        ]);
+        viewer.diff_mode = true;
+        viewer.cursor_line = 1; // Removed line
+        assert_eq!(viewer.cursor_file_line(), None);
+    }
+
+    #[test]
+    fn diff_mode_cursor_down_skips_removed_for_comments() {
+        // Setup: diff with Context, Removed, Added, Context
+        // Comment at file line 1 (Context line at disp_idx=0)
+        let content: Vec<u8> = b"ctx1\nnew\nctx2\n".to_vec();
+        let (_tmp, path) = tmp_file("test.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.diff_mode = true;
+        viewer.unified_diff = Some(UnifiedDiff {
+            lines: vec![
+                UnifiedDiffLine::Context("ctx1".into()),  // disp 0, file 1
+                UnifiedDiffLine::Removed("old".into()),   // disp 1, file None
+                UnifiedDiffLine::Added("new".into()),      // disp 2, file 2
+                UnifiedDiffLine::Context("ctx2".into()),  // disp 3, file 3
+            ],
+        });
+        viewer.compute_diff_line_numbers();
+        viewer.comments = vec![make_comment(&path, 1, 1)]; // comment at file line 1
+
+        viewer.cursor_line = 0; // on Context line (file line 1)
+        // cursor_down should stop on comment (comment ends at file line 1)
+        viewer.cursor_down();
+        assert_eq!(viewer.cursor_on_comment, Some((1, 1)));
+        assert_eq!(viewer.cursor_line, 0);
+
+        // cursor_down from comment → next display line
+        viewer.cursor_down();
+        assert!(viewer.cursor_on_comment.is_none());
+        assert_eq!(viewer.cursor_line, 1); // Removed line
+
+        // cursor_down on Removed line (None) → just advance, no comment stop
+        viewer.cursor_down();
+        assert!(viewer.cursor_on_comment.is_none());
+        assert_eq!(viewer.cursor_line, 2); // Added line
+    }
+
+    #[test]
+    fn diff_mode_cursor_up_stops_on_comment() {
+        let content: Vec<u8> = b"ctx1\nnew\nctx2\n".to_vec();
+        let (_tmp, path) = tmp_file("test.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.diff_mode = true;
+        viewer.unified_diff = Some(UnifiedDiff {
+            lines: vec![
+                UnifiedDiffLine::Context("ctx1".into()),  // disp 0, file 1
+                UnifiedDiffLine::Added("new".into()),      // disp 1, file 2
+                UnifiedDiffLine::Context("ctx2".into()),  // disp 2, file 3
+            ],
+        });
+        viewer.compute_diff_line_numbers();
+        viewer.comments = vec![make_comment(&path, 1, 1)]; // comment at file line 1
+
+        viewer.cursor_line = 1; // on Added line (file line 2)
+        // cursor_up: previous line (disp 0) has file line 1, comment ends there → stop
+        viewer.cursor_up();
+        assert_eq!(viewer.cursor_on_comment, Some((1, 1)));
+        assert_eq!(viewer.cursor_line, 0);
+
+        // cursor_up from comment → stays at code line 0
+        viewer.cursor_up();
+        assert!(viewer.cursor_on_comment.is_none());
+        assert_eq!(viewer.cursor_line, 0);
+    }
+
+    // --- Tests for click-to-focus ---
+
+    #[test]
+    fn click_line_moves_cursor_to_clicked_row() {
+        let content: Vec<u8> = (0..20).map(|i| format!("line {i}\n")).collect::<String>().into();
+        let (_tmp, path) = tmp_file("test.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.visible_height = 10;
+        viewer.scroll_offset = 0;
+        // Simulate content_rect as if rendered at (5, 2) with 80x10
+        viewer.content_rect = Some(Rect::new(5, 2, 80, 10));
+
+        // Click on row 5 (inner row = 5 - 2 = 3, target = 0 + 3 = 3)
+        assert!(viewer.click_line(5, 10));
+        assert_eq!(viewer.cursor_line, 3);
+        assert!(viewer.cursor_on_comment.is_none());
+    }
+
+    #[test]
+    fn click_line_with_scroll_offset() {
+        let content: Vec<u8> = (0..20).map(|i| format!("line {i}\n")).collect::<String>().into();
+        let (_tmp, path) = tmp_file("test.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.visible_height = 10;
+        viewer.scroll_offset = 5;
+        viewer.content_rect = Some(Rect::new(5, 2, 80, 10));
+
+        // Click on row 4 (inner row = 4 - 2 = 2, target = 5 + 2 = 7)
+        assert!(viewer.click_line(4, 10));
+        assert_eq!(viewer.cursor_line, 7);
+    }
+
+    #[test]
+    fn click_line_clamps_to_max_line() {
+        let content: Vec<u8> = (0..5).map(|i| format!("line {i}\n")).collect::<String>().into();
+        let (_tmp, path) = tmp_file("test.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.visible_height = 10;
+        viewer.scroll_offset = 0;
+        viewer.content_rect = Some(Rect::new(0, 0, 80, 10));
+
+        // Click on row 8 → target = 8 but only 5 lines → clamp to 4
+        assert!(viewer.click_line(8, 10));
+        assert_eq!(viewer.cursor_line, 4);
+    }
+
+    #[test]
+    fn click_line_outside_content_rect_returns_false() {
+        let mut viewer = FileViewer::new();
+        viewer.content_rect = Some(Rect::new(5, 2, 80, 10));
+
+        // Click above content area
+        assert!(!viewer.click_line(1, 10));
+        // Click left of content area
+        assert!(!viewer.click_line(5, 3));
+    }
+
+    #[test]
+    fn click_line_without_content_rect_returns_false() {
+        let mut viewer = FileViewer::new();
+        assert!(!viewer.click_line(5, 10));
+    }
+
+    // --- Tests for scroll position preservation on diff/preview toggle ---
+
+    #[test]
+    fn diff_display_index_for_file_line_exact_match() {
+        let viewer = make_diff_viewer(vec![
+            UnifiedDiffLine::Context("a".into()),  // idx 0, file 1
+            UnifiedDiffLine::Removed("b".into()),   // idx 1, file None
+            UnifiedDiffLine::Added("c".into()),      // idx 2, file 2
+            UnifiedDiffLine::Context("d".into()),  // idx 3, file 3
+        ]);
+        assert_eq!(viewer.diff_display_index_for_file_line(1), 0);
+        assert_eq!(viewer.diff_display_index_for_file_line(2), 2);
+        assert_eq!(viewer.diff_display_index_for_file_line(3), 3);
+    }
+
+    #[test]
+    fn diff_display_index_for_file_line_nearest() {
+        // Only file lines 5 and 10 exist in the diff
+        let mut viewer = FileViewer::new();
+        viewer.diff_line_numbers = vec![Some(5), None, Some(10)];
+        // file_line 7 is closer to 5 (dist=2) than to 10 (dist=3)
+        assert_eq!(viewer.diff_display_index_for_file_line(7), 0);
+        // file_line 8 is closer to 10 (dist=2) than to 5 (dist=3)
+        assert_eq!(viewer.diff_display_index_for_file_line(8), 2);
+    }
+
+    #[test]
+    fn resolve_nearest_file_line_on_context() {
+        let mut viewer = make_diff_viewer(vec![
+            UnifiedDiffLine::Context("a".into()),
+            UnifiedDiffLine::Added("b".into()),
+        ]);
+        viewer.diff_mode = true;
+        viewer.cursor_line = 0;
+        assert_eq!(viewer.resolve_nearest_file_line(), Some(1));
+    }
+
+    #[test]
+    fn resolve_nearest_file_line_on_removed() {
+        let mut viewer = make_diff_viewer(vec![
+            UnifiedDiffLine::Context("a".into()),  // idx 0, file 1
+            UnifiedDiffLine::Removed("b".into()),   // idx 1, file None
+            UnifiedDiffLine::Added("c".into()),      // idx 2, file 2
+        ]);
+        viewer.diff_mode = true;
+        viewer.cursor_line = 1; // Removed line
+        // Should resolve to file line 2 (next Added line, searching down first)
+        assert_eq!(viewer.resolve_nearest_file_line(), Some(2));
+    }
+
+    #[test]
+    fn toggle_preview_to_diff_preserves_position() {
+        let content: Vec<u8> = (0..20).map(|i| format!("line {i}\n")).collect::<String>().into();
+        let (_tmp, path) = tmp_file("test.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.visible_height = 10;
+
+        // Diff: all context lines (1:1 mapping with file lines)
+        let diff_lines: Vec<UnifiedDiffLine> = (0..20)
+            .map(|i| UnifiedDiffLine::Context(format!("line {i}")))
+            .collect();
+        viewer.set_diff(None, Some(UnifiedDiff { lines: diff_lines }));
+
+        // Position cursor at line 12 (0-indexed), scroll_offset = 8
+        viewer.cursor_line = 12;
+        viewer.scroll_offset = 8;
+        // screen_row = 12 - 8 = 4
+
+        // Toggle to diff mode
+        let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
+        let _ = viewer.handle_event(key);
+
+        assert!(viewer.diff_mode);
+        // File line was 13 (1-indexed), diff display index should be 12 (0-indexed)
+        assert_eq!(viewer.cursor_line, 12);
+        // screen_row preserved: scroll_offset = cursor_line - screen_row = 12 - 4 = 8
+        assert_eq!(viewer.scroll_offset, 8);
+    }
+
+    #[test]
+    fn toggle_diff_to_preview_preserves_position() {
+        let content: Vec<u8> = (0..20).map(|i| format!("line {i}\n")).collect::<String>().into();
+        let (_tmp, path) = tmp_file("test.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.visible_height = 10;
+
+        let diff_lines: Vec<UnifiedDiffLine> = (0..20)
+            .map(|i| UnifiedDiffLine::Context(format!("line {i}")))
+            .collect();
+        viewer.set_diff(None, Some(UnifiedDiff { lines: diff_lines }));
+
+        // Start in diff mode
+        viewer.diff_mode = true;
+        viewer.compute_diff_line_numbers();
+        viewer.cursor_line = 15;
+        viewer.scroll_offset = 11;
+        // screen_row = 15 - 11 = 4
+
+        // Toggle to preview
+        let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
+        let _ = viewer.handle_event(key);
+
+        assert!(!viewer.diff_mode);
+        // diff display 15 → file line 16 → preview index 15
+        assert_eq!(viewer.cursor_line, 15);
+        assert_eq!(viewer.scroll_offset, 11);
+    }
+
+    #[test]
+    fn toggle_from_removed_line_preserves_position() {
+        let content: Vec<u8> = b"ctx\nnew\nctx2\n".to_vec();
+        let (_tmp, path) = tmp_file("test.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.visible_height = 10;
+
+        viewer.diff_mode = true;
+        viewer.unified_diff = Some(UnifiedDiff {
+            lines: vec![
+                UnifiedDiffLine::Context("ctx".into()),   // disp 0, file 1
+                UnifiedDiffLine::Removed("old".into()),    // disp 1, file None
+                UnifiedDiffLine::Added("new".into()),       // disp 2, file 2
+                UnifiedDiffLine::Context("ctx2".into()),  // disp 3, file 3
+            ],
+        });
+        viewer.compute_diff_line_numbers();
+        viewer.cursor_line = 1; // Removed line
+        viewer.scroll_offset = 0;
+
+        // Toggle to preview
+        let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
+        let _ = viewer.handle_event(key);
+
+        assert!(!viewer.diff_mode);
+        // Resolved nearest file line is 2 (Added below), preview index = 1
+        assert_eq!(viewer.cursor_line, 1);
+    }
+
+    #[test]
+    fn toggle_clamps_scroll_offset() {
+        let content: Vec<u8> = (0..5).map(|i| format!("line {i}\n")).collect::<String>().into();
+        let (_tmp, path) = tmp_file("test.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.visible_height = 10;
+
+        // Diff with extra Removed lines (more total lines than preview)
+        viewer.diff_mode = true;
+        let mut diff_lines: Vec<UnifiedDiffLine> = Vec::new();
+        for i in 0..5 {
+            diff_lines.push(UnifiedDiffLine::Removed(format!("old {i}")));
+            diff_lines.push(UnifiedDiffLine::Added(format!("line {i}")));
+        }
+        viewer.unified_diff = Some(UnifiedDiff { lines: diff_lines });
+        viewer.compute_diff_line_numbers();
+        // 10 display lines, cursor at 8, scroll at 5 → screen_row = 3
+        viewer.cursor_line = 8;
+        viewer.scroll_offset = 5;
+
+        // Toggle to preview (only 5 lines → max_scroll might be 0)
+        let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
+        let _ = viewer.handle_event(key);
+
+        assert!(!viewer.diff_mode);
+        // scroll_offset should be clamped to max_scroll
+        assert!(viewer.scroll_offset <= viewer.max_scroll());
+        assert!(viewer.cursor_line < viewer.total_lines());
+    }
+
+    #[test]
+    fn range_comment_navigation_round_trip() {
+        let content: Vec<u8> = (0..10).map(|i| format!("line {i}\n")).collect::<String>().into();
+        let (_tmp, path) = tmp_file("test.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        // Range comment L2-L5 (1-indexed), renders after end_line=5
+        viewer.comments = vec![make_comment(&path, 2, 5)];
+        viewer.cursor_line = 3; // 0-indexed, 1-indexed line 4
+
+        // Move down: no comment ends at line 4, so cursor moves to cursor_line=4 (line 5)
+        viewer.cursor_down();
+        assert!(viewer.cursor_on_comment.is_none());
+        assert_eq!(viewer.cursor_line, 4);
+
+        // Move down again: comment ends at line 5 → stops on comment
+        viewer.cursor_down();
+        assert_eq!(viewer.cursor_on_comment, Some((2, 5)));
+        assert_eq!(viewer.cursor_line, 4);
+
+        // Move down from comment → next code line (end_line=5, 0-indexed=5)
+        viewer.cursor_down();
+        assert!(viewer.cursor_on_comment.is_none());
+        assert_eq!(viewer.cursor_line, 5);
+
+        // Move back up → should stop on the comment again
+        viewer.cursor_up();
+        assert_eq!(viewer.cursor_on_comment, Some((2, 5)));
+        assert_eq!(viewer.cursor_line, 4);
+
+        // Move up from comment → code line above
+        viewer.cursor_up();
+        assert!(viewer.cursor_on_comment.is_none());
+        assert_eq!(viewer.cursor_line, 4);
     }
 
 }

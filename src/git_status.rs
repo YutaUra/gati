@@ -13,6 +13,7 @@ pub enum FileStatus {
 
 impl FileStatus {
     /// Short marker string for display in the file tree.
+    #[cfg(test)]
     pub fn marker(&self) -> &'static str {
         match self {
             FileStatus::Modified => "[M]",
