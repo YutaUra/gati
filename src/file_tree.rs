@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -54,7 +55,13 @@ impl FileTree {
         })
     }
 
-    pub fn render_to_buffer(&mut self, area: Rect, buf: &mut Buffer, focused: bool) {
+    pub fn render_to_buffer(
+        &mut self,
+        area: Rect,
+        buf: &mut Buffer,
+        focused: bool,
+        commented_files: &HashSet<PathBuf>,
+    ) {
         let border_style = if focused {
             Style::default().fg(Color::Cyan)
         } else {
@@ -135,6 +142,21 @@ impl FileTree {
                     Style::default().fg(color)
                 };
                 spans.push(Span::styled(marker, marker_style));
+            }
+
+            // Comment indicator
+            let has_comments = if entry.is_directory {
+                commented_files.iter().any(|f| f.starts_with(&entry.path))
+            } else {
+                commented_files.contains(&entry.path)
+            };
+            if has_comments {
+                let comment_style = if is_selected {
+                    Style::default().fg(Color::Cyan).bg(Color::White)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                };
+                spans.push(Span::styled(" [C]", comment_style));
             }
 
             let line = Line::from(spans);

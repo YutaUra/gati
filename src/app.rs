@@ -1,5 +1,6 @@
 use std::io;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{self, Event, KeyEventKind},
@@ -34,6 +35,8 @@ const MIN_PANE_PERCENT: u16 = 10;
 const MAX_TREE_PERCENT: u16 = 70;
 /// Lines to scroll per mouse wheel tick.
 const MOUSE_SCROLL_LINES: usize = 5;
+/// How long flash messages remain visible in the hint bar.
+const FLASH_DURATION: Duration = Duration::from_secs(3);
 
 /// Compute clamped tree width percentage from a desired column position.
 /// Returns a percentage in [min_percent, MAX_TREE_PERCENT] ensuring both panes
@@ -103,6 +106,8 @@ pub struct App {
     pub tree_inner_y: u16,
     /// Whether the help dialog overlay is currently visible.
     pub show_help: bool,
+    /// Temporary flash message shown in the hint bar, auto-dismissed after FLASH_DURATION.
+    pub flash_message: Option<(String, Color, Instant)>,
 }
 
 impl App {
@@ -163,6 +168,7 @@ impl App {
             saved_tree_width_percent: 30,
             tree_inner_y: 0,
             show_help: false,
+            flash_message: None,
         })
     }
 
@@ -248,20 +254,40 @@ impl App {
         false
     }
 
-    fn export_comments(&self) {
+    fn export_comments(&mut self) {
         let text = self.comment_store.export();
         if text.is_empty() {
+            self.flash_message = Some(("No comments to export".into(), Color::Yellow, Instant::now()));
             return;
         }
-        // Try to copy to clipboard; ignore errors silently
-        let _ = cli_clipboard::set_contents(text);
+        match cli_clipboard::set_contents(text) {
+            Ok(_) => {
+                let count = self.comment_store.len();
+                self.flash_message = Some((
+                    format!("Copied {} comment(s) to clipboard", count),
+                    Color::Green,
+                    Instant::now(),
+                ));
+            }
+            Err(_) => {
+                self.flash_message = Some((
+                    "Failed to copy to clipboard".into(),
+                    Color::Red,
+                    Instant::now(),
+                ));
+            }
+        }
     }
 
     /// Refresh state when the filesystem watcher detects changes.
-    /// Re-reads the file tree and recomputes diff for the currently viewed file.
+    /// Re-reads the file content, file tree, and recomputes diff for the currently viewed file.
     fn refresh_on_fs_change(&mut self) {
         let _ = self.file_tree.model.refresh_tree();
+        // Reload file content from disk (preserves cursor/scroll position)
+        self.file_viewer.reload_content();
         if let Some(path) = self.file_viewer.current_file().map(|p| p.to_path_buf()) {
+            let current_lines = self.file_viewer.current_lines();
+            self.comment_store.relocate_comments(&path, current_lines);
             self.load_diff_for_file(&path);
         }
     }
@@ -415,6 +441,22 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<(
     }
 }
 
+fn extract_code_context(
+    content: &crate::file_viewer::ViewerContent,
+    file: &std::path::Path,
+    start_line: usize,
+    end_line: usize,
+) -> Vec<String> {
+    if let crate::file_viewer::ViewerContent::File { path, lines, .. } = content {
+        if path == file {
+            let start = start_line.saturating_sub(1).min(lines.len());
+            let end = end_line.min(lines.len());
+            return lines[start..end].to_vec();
+        }
+    }
+    vec![]
+}
+
 fn handle_comment_input(app: &mut App, key: crossterm::event::KeyEvent) {
     use crossterm::event::KeyCode;
 
@@ -429,8 +471,10 @@ fn handle_comment_input(app: &mut App, key: crossterm::event::KeyEvent) {
             } = app.input_mode
             {
                 if !text.is_empty() {
+                    let code_context =
+                        extract_code_context(&app.file_viewer.content, file, start_line, end_line);
                     app.comment_store
-                        .add(file, start_line, end_line, text.clone());
+                        .add(file, start_line, end_line, text.clone(), code_context);
                 }
             }
             app.input_mode = InputMode::Normal;
@@ -690,14 +734,18 @@ fn draw(frame: &mut Frame, app: &mut App) {
     // (render_to_buffer also sets this, but we need it before the first render)
     app.file_tree.visible_height = tree_area.height.saturating_sub(2) as usize;
 
-    // Update file viewer's comments for current file
+    // Update file viewer's comments for current file (with staleness info)
     if let Some(file) = app.file_viewer.current_file() {
         let file = file.to_path_buf();
+        let current_lines = app.file_viewer.current_lines();
         app.file_viewer.comments = app
             .comment_store
             .for_file(&file)
             .into_iter()
-            .cloned()
+            .map(|c| {
+                let stale = c.is_stale(current_lines);
+                (c.clone(), stale)
+            })
             .collect();
     } else {
         app.file_viewer.comments.clear();
@@ -730,9 +778,15 @@ fn draw(frame: &mut Frame, app: &mut App) {
     };
 
     // Render panes
+    let commented_files: std::collections::HashSet<std::path::PathBuf> = app
+        .comment_store
+        .files_with_comments()
+        .into_iter()
+        .map(|p| p.to_path_buf())
+        .collect();
     let buf = frame.buffer_mut();
     app.file_tree
-        .render_to_buffer(tree_area, buf, app.focus == Focus::Tree);
+        .render_to_buffer(tree_area, buf, app.focus == Focus::Tree, &commented_files);
     app.file_viewer
         .render_to_buffer(viewer_area, buf, app.focus == Focus::Viewer);
 
@@ -746,32 +800,38 @@ fn draw(frame: &mut Frame, app: &mut App) {
         }
     }
 
+    // Clear expired flash messages
+    if let Some((_, _, created)) = &app.flash_message {
+        if created.elapsed() >= FLASH_DURATION {
+            app.flash_message = None;
+        }
+    }
+
     // Render key hint bar (or comment input)
-    let hints: String = match &app.input_mode {
+    let (hints, hint_color): (String, Color) = match &app.input_mode {
         InputMode::CommentInput { start_line, end_line, .. } => {
             let range = if start_line == end_line {
                 format!("L{}", start_line)
             } else {
                 format!("L{}-{}", start_line, end_line)
             };
-            format!("Editing comment on {}  Enter save  Esc cancel", range)
+            (format!("Editing comment on {}  Enter save  Esc cancel", range), Color::DarkGray)
         }
         InputMode::LineSelect { .. } => {
-            "j/k extend  c comment  Esc cancel".into()
+            ("j/k extend  c comment  Esc cancel".into(), Color::DarkGray)
         }
         InputMode::Normal => {
-            if app.file_tree.search.is_some() {
-                "Enter confirm  Esc cancel  ↑/↓ navigate".into()
+            if let Some((msg, color, _)) = &app.flash_message {
+                (msg.clone(), *color)
+            } else if app.file_tree.search.is_some() {
+                ("Enter confirm  Esc cancel  ↑/↓ navigate".into(), Color::DarkGray)
             } else {
-                "? help  q quit".into()
+                ("? help  q quit".into(), Color::DarkGray)
             }
         }
     };
 
-    let hint_line = Line::from(Span::styled(
-        &hints,
-        Style::default().fg(Color::DarkGray),
-    ));
+    let hint_line = Line::from(Span::styled(&hints, Style::default().fg(hint_color)));
     buf.set_line(hint_area.x, hint_area.y, &hint_line, hint_area.width);
 
     // Help dialog overlay
@@ -852,7 +912,7 @@ fn draw_help_dialog(buf: &mut ratatui::buffer::Buffer, area: Rect) {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     fn setup_dir(files: &[&str], dirs: &[&str]) -> TempDir {
@@ -1062,7 +1122,7 @@ mod tests {
         let tmp = setup_dir(&["file.rs"], &[]);
         let path = tmp.path().join("file.rs");
         let mut app = App::new(&make_target(tmp.path(), Some(path.clone()))).unwrap();
-        app.comment_store.add(&path, 1, 1, "Delete me".into());
+        app.comment_store.add(&path, 1, 1, "Delete me".into(), vec![]);
         app.focus = Focus::Viewer;
 
         app.handle_action(Action::DeleteComment);
@@ -1075,7 +1135,7 @@ mod tests {
         let tmp = setup_dir(&["file.rs"], &[]);
         let path = tmp.path().join("file.rs");
         let mut app = App::new(&make_target(tmp.path(), Some(path.clone()))).unwrap();
-        app.comment_store.add(&path, 2, 4, "Existing comment".into());
+        app.comment_store.add(&path, 2, 4, "Existing comment".into(), vec![]);
         app.focus = Focus::Viewer;
         app.file_viewer.cursor_line = 3; // 0-indexed
         app.file_viewer.cursor_on_comment = Some((2, 4));
@@ -1098,7 +1158,7 @@ mod tests {
         let path = tmp.path().join("file.rs");
         let mut app = App::new(&make_target(tmp.path(), Some(path.clone()))).unwrap();
         // Add a range comment covering lines 1-5
-        app.comment_store.add(&path, 1, 5, "Range comment".into());
+        app.comment_store.add(&path, 1, 5, "Range comment".into(), vec![]);
         app.focus = Focus::Viewer;
         app.file_viewer.cursor_line = 2; // 0-indexed, line 3 in 1-indexed (within range)
         // cursor_on_comment is None → should create new, not edit existing
@@ -1120,7 +1180,7 @@ mod tests {
         let tmp = setup_dir(&["file.rs"], &[]);
         let path = tmp.path().join("file.rs");
         let mut app = App::new(&make_target(tmp.path(), Some(path.clone()))).unwrap();
-        app.comment_store.add(&path, 3, 5, "Delete me".into());
+        app.comment_store.add(&path, 3, 5, "Delete me".into(), vec![]);
         app.focus = Focus::Viewer;
         app.file_viewer.cursor_on_comment = Some((3, 5));
 
@@ -1893,5 +1953,106 @@ mod tests {
             crate::diff::DiffLineKind::Added,
             "new line 3 should be marked as Added after fs change refresh"
         );
+    }
+
+    #[test]
+    fn extract_code_context_returns_correct_lines() {
+        let content = crate::file_viewer::ViewerContent::File {
+            path: PathBuf::from("test.rs"),
+            lines: vec![
+                "line 1".into(),
+                "line 2".into(),
+                "line 3".into(),
+                "line 4".into(),
+                "line 5".into(),
+            ],
+            syntax_name: "Rust".into(),
+        };
+        let result = extract_code_context(&content, Path::new("test.rs"), 2, 4);
+        assert_eq!(result, vec!["line 2", "line 3", "line 4"]);
+    }
+
+    #[test]
+    fn extract_code_context_clamps_to_file_length() {
+        let content = crate::file_viewer::ViewerContent::File {
+            path: PathBuf::from("test.rs"),
+            lines: vec!["line 1".into(), "line 2".into(), "line 3".into()],
+            syntax_name: "Rust".into(),
+        };
+        let result = extract_code_context(&content, Path::new("test.rs"), 2, 10);
+        assert_eq!(result, vec!["line 2", "line 3"]);
+    }
+
+    #[test]
+    fn extract_code_context_returns_empty_for_wrong_file() {
+        let content = crate::file_viewer::ViewerContent::File {
+            path: PathBuf::from("other.rs"),
+            lines: vec!["line 1".into()],
+            syntax_name: "Rust".into(),
+        };
+        let result = extract_code_context(&content, Path::new("test.rs"), 1, 1);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn extract_code_context_returns_empty_for_placeholder() {
+        let content = crate::file_viewer::ViewerContent::Placeholder;
+        let result = extract_code_context(&content, Path::new("test.rs"), 1, 1);
+        assert!(result.is_empty());
+    }
+
+    // Flash message tests
+    #[test]
+    fn export_sets_flash_message_on_success() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let path = tmp.path().join("file.rs");
+        let mut app = App::new(&make_target(tmp.path(), Some(path.clone()))).unwrap();
+        app.comment_store.add(&path, 1, 1, "A comment".into(), vec![]);
+
+        app.export_comments();
+
+        let (msg, color, _) = app.flash_message.as_ref().expect("flash_message should be set");
+        assert!(msg.contains("1 comment(s)"));
+        assert_eq!(*color, Color::Green);
+    }
+
+    #[test]
+    fn export_sets_flash_message_when_empty() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+
+        app.export_comments();
+
+        let (msg, color, _) = app.flash_message.as_ref().expect("flash_message should be set");
+        assert_eq!(msg, "No comments to export");
+        assert_eq!(*color, Color::Yellow);
+    }
+
+    #[test]
+    fn flash_message_not_shown_in_comment_input_mode() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let path = tmp.path().join("file.rs");
+        let mut app = App::new(&make_target(tmp.path(), Some(path.clone()))).unwrap();
+        app.flash_message = Some(("test flash".into(), Color::Green, Instant::now()));
+        app.input_mode = InputMode::CommentInput {
+            file: path,
+            start_line: 1,
+            end_line: 1,
+            text: String::new(),
+        };
+
+        // In CommentInput mode, hints should show comment-related text, not the flash
+        let hints = match &app.input_mode {
+            InputMode::CommentInput { start_line, end_line, .. } => {
+                let range = if start_line == end_line {
+                    format!("L{}", start_line)
+                } else {
+                    format!("L{}-{}", start_line, end_line)
+                };
+                format!("Editing comment on {}  Enter save  Esc cancel", range)
+            }
+            _ => unreachable!(),
+        };
+        assert!(hints.contains("Editing comment"));
     }
 }
