@@ -1383,6 +1383,7 @@ impl Component for FileViewer {
             (KeyCode::Char('x'), KeyModifiers::NONE) => Ok(Action::DeleteComment),
             (KeyCode::Char('V'), KeyModifiers::SHIFT) => Ok(Action::StartLineSelect),
             (KeyCode::Char('e'), KeyModifiers::NONE) => Ok(Action::ExportComments),
+            (KeyCode::Char('B'), KeyModifiers::SHIFT) => Ok(Action::BugReport),
             (KeyCode::Char('d'), KeyModifiers::NONE) => {
                 // Toggle diff mode (only when unified diff data is available)
                 if self.unified_diff.is_some() {

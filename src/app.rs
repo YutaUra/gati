@@ -249,6 +249,25 @@ impl App {
             Action::ExportComments => {
                 self.export_comments();
             }
+            Action::BugReport => {
+                let url = crate::bug_report::build_url("Bug report", "");
+                match crate::bug_report::try_open(&url) {
+                    crate::bug_report::OpenResult::Opened => {
+                        self.flash_message = Some((
+                            "Opened bug report in browser".into(),
+                            Color::Green,
+                            Instant::now(),
+                        ));
+                    }
+                    crate::bug_report::OpenResult::Failed(e) => {
+                        self.flash_message = Some((
+                            format!("Failed to open browser: {}", e),
+                            Color::Red,
+                            Instant::now(),
+                        ));
+                    }
+                }
+            }
             Action::None => {}
         }
         false
@@ -330,7 +349,38 @@ fn install_panic_hook() {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let _ = restore_terminal();
+
+        // Build the crash log from panic info
+        let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic".into()
+        };
+
+        let location = panic_info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".into());
+
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let crash_log = format!(
+            "panicked at '{}', {}\n\nstack backtrace:\n{}",
+            message, location, backtrace
+        );
+
+        // Print the original panic output
         original_hook(panic_info);
+
+        // Then print the bug report URL
+        let url = crate::bug_report::build_panic_url(&crash_log);
+        let link = crate::bug_report::hyperlink(&url, "Report this crash on GitHub");
+        eprintln!();
+        eprintln!("  {}", link);
+        eprintln!();
+        eprintln!("  {}", url);
+        eprintln!();
     }));
 }
 
@@ -860,6 +910,9 @@ fn draw_help_dialog(buf: &mut ratatui::buffer::Buffer, area: Rect) {
         "   V             line select",
         "   e             export comments",
         "   b             toggle focus mode",
+        "",
+        " Other",
+        "   B             report bug / feedback",
         "",
         " Press ? or Esc to close",
     ];

@@ -15,6 +15,7 @@ syntect = { version = "5", default-features = false, features = ["default-syntax
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 cli-clipboard = "0.4.0"
 notify-debouncer-mini = "0.5"
+open = "5"
 
 [dev-dependencies]
 tempfile = "3"

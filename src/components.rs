@@ -21,6 +21,8 @@ pub enum Action {
     ExportComments,
     /// User pressed `x` to delete comment on cursor line.
     DeleteComment,
+    /// User pressed `B` to open bug report / feedback URL.
+    BugReport,
 }
 
 /// Trait for TUI components.

@@ -1,4 +1,5 @@
 mod app;
+mod bug_report;
 mod comments;
 mod components;
 mod diff;
@@ -19,6 +20,10 @@ struct Cli {
     /// Path to open (directory or file). Defaults to current directory.
     #[arg(default_value = ".")]
     path: PathBuf,
+
+    /// Print a pre-filled GitHub issue URL for bug reporting and exit.
+    #[arg(long)]
+    bug_report: bool,
 }
 
 /// Resolved startup target from CLI arguments.
@@ -58,6 +63,14 @@ fn resolve_target(path: &std::path::Path) -> anyhow::Result<StartupTarget> {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    if cli.bug_report {
+        let url = bug_report::build_url("Bug report", "");
+        println!("{}", url);
+        bug_report::open_or_print(&url);
+        return Ok(());
+    }
+
     let target = resolve_target(&cli.path)?;
     app::run(&target)
 }
@@ -107,5 +120,17 @@ mod tests {
             err_msg.contains("does not exist"),
             "Expected 'does not exist' in error message, got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn bug_report_flag_parses() {
+        let cli = Cli::try_parse_from(["gati", "--bug-report"]).unwrap();
+        assert!(cli.bug_report);
+    }
+
+    #[test]
+    fn bug_report_flag_defaults_to_false() {
+        let cli = Cli::try_parse_from(["gati"]).unwrap();
+        assert!(!cli.bug_report);
     }
 }
