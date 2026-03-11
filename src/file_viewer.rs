@@ -18,6 +18,16 @@ use crate::components::{Action, Component};
 use crate::diff::{DiffLineKind, LineDiff, UnifiedDiff, UnifiedDiffLine};
 use crate::highlight::Highlighter;
 
+/// Identity of a visual row in the file viewer, used to map click positions
+/// back to code lines or comment blocks.
+#[derive(Clone, Copy, Debug)]
+enum VisualRowContent {
+    /// Code line at the given 0-indexed position.
+    CodeLine(usize),
+    /// Comment row for the comment spanning (start_line, end_line), both 1-indexed.
+    CommentRow(usize, usize),
+}
+
 /// Columns to scroll per horizontal scroll tick.
 pub const H_SCROLL_AMOUNT: usize = 4;
 
@@ -38,6 +48,7 @@ pub enum MinimapMarker {
     Modified,
     Removed,
     Comment,
+    StaleComment,
 }
 
 /// Content to display in the file viewer.
@@ -100,7 +111,8 @@ pub struct FileViewer {
     /// Whether the viewer is currently in diff mode.
     pub diff_mode: bool,
     /// Comments for the currently viewed file (set before each render by App).
-    pub comments: Vec<Comment>,
+    /// Each entry is (comment, is_stale).
+    pub comments: Vec<(Comment, bool)>,
     /// Cached minimap rectangle from the last render (for mouse hit-testing).
     pub minimap_rect: Option<Rect>,
     /// Inline comment editor state (set by App before render, cleared after).
@@ -116,6 +128,9 @@ pub struct FileViewer {
     pub diff_line_numbers: Vec<Option<usize>>,
     /// Cached content area rectangle from the last render (for mouse hit-testing).
     pub content_rect: Option<Rect>,
+    /// Mapping from visual row offset (relative to content area) to content identity.
+    /// Built during render, consumed by click_line.
+    row_map: Vec<VisualRowContent>,
 }
 
 impl FileViewer {
@@ -142,6 +157,7 @@ impl FileViewer {
             cursor_on_comment: None,
             diff_line_numbers: Vec::new(),
             content_rect: None,
+            row_map: Vec::new(),
         }
     }
 
@@ -316,6 +332,62 @@ impl FileViewer {
         };
     }
 
+    /// Re-read the current file from disk without resetting cursor/scroll position.
+    /// Used by the filesystem watcher to keep content fresh.
+    /// Returns true if the content was updated, false if no file is loaded or read failed.
+    pub fn reload_content(&mut self) -> bool {
+        let path = match &self.content {
+            ViewerContent::File { path, .. } => path.clone(),
+            _ => return false,
+        };
+
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.content = ViewerContent::Error(format!(
+                    "{} — File has been deleted from disk",
+                    path.display(),
+                ));
+                return true;
+            }
+            Err(_) => return false,
+        };
+
+        if is_binary(&bytes) {
+            self.content = ViewerContent::Binary(path);
+            return true;
+        }
+
+        let text = String::from_utf8_lossy(&bytes);
+        if text.is_empty() {
+            self.content = ViewerContent::Empty(path);
+            return true;
+        }
+
+        let new_lines: Vec<String> = text.lines().map(String::from).collect();
+        let first_line = new_lines.first().map(|s| s.as_str()).unwrap_or("");
+        let syntax = self.highlighter.detect_syntax(&path, first_line);
+        let syntax_name = syntax.name.clone();
+
+        // Clamp cursor if file got shorter
+        let max_line = new_lines.len().saturating_sub(1);
+        if self.cursor_line > max_line {
+            self.cursor_line = max_line;
+        }
+
+        // Clear highlight cache — will be recomputed lazily during render
+        self.highlighted_lines.clear();
+        self.hl_parse_state = None;
+        self.hl_highlight_state = None;
+
+        self.content = ViewerContent::File {
+            path,
+            lines: new_lines,
+            syntax_name,
+        };
+        true
+    }
+
     fn total_lines(&self) -> usize {
         if self.diff_mode {
             return self.unified_diff.as_ref().map_or(0, |d| {
@@ -419,8 +491,12 @@ impl FileViewer {
     }
 
     /// Find comment that ends at a given file line (1-indexed).
-    fn comment_at_end_line(&self, line: usize) -> Option<&Comment> {
-        self.comments.iter().find(|c| c.end_line == line)
+    /// Returns (comment, is_stale).
+    fn comment_at_end_line(&self, line: usize) -> Option<(&Comment, bool)> {
+        self.comments
+            .iter()
+            .find(|(c, _)| c.end_line == line)
+            .map(|(c, stale)| (c, *stale))
     }
 
     /// Compute minimap markers for each row of the minimap.
@@ -454,7 +530,7 @@ impl FileViewer {
                     };
                     if let Some(m) = marker {
                         // Diff markers only set if no comment marker already present
-                        if markers[row] != Some(MinimapMarker::Comment) {
+                        if !matches!(markers[row], Some(MinimapMarker::Comment | MinimapMarker::StaleComment)) {
                             markers[row] = Some(m);
                         }
                     }
@@ -475,7 +551,7 @@ impl FileViewer {
                         DiffLineKind::Unchanged => None,
                     };
                     if let Some(m) = marker {
-                        if markers[row] != Some(MinimapMarker::Comment) {
+                        if !matches!(markers[row], Some(MinimapMarker::Comment | MinimapMarker::StaleComment)) {
                             markers[row] = Some(m);
                         }
                     }
@@ -484,7 +560,12 @@ impl FileViewer {
         }
 
         // Comment markers (highest priority, overwrite diff markers)
-        for comment in &self.comments {
+        for (comment, is_stale) in &self.comments {
+            let marker = if *is_stale {
+                MinimapMarker::StaleComment
+            } else {
+                MinimapMarker::Comment
+            };
             for line_num in comment.start_line..=comment.end_line {
                 let idx = if self.diff_mode {
                     // In diff mode, approximate position
@@ -494,7 +575,7 @@ impl FileViewer {
                 };
                 let row = idx * minimap_height / total.max(1);
                 if row < minimap_height {
-                    markers[row] = Some(MinimapMarker::Comment);
+                    markers[row] = Some(marker);
                 }
             }
         }
@@ -522,10 +603,30 @@ impl FileViewer {
             return false;
         }
         let inner_row = (row - cr.y) as usize;
-        let target = self.scroll_offset + inner_row;
-        let max = self.total_lines().saturating_sub(1);
-        self.cursor_line = target.min(max);
-        self.cursor_on_comment = None;
+        if self.row_map.is_empty() {
+            // Fallback when row_map has not been built yet (before first render)
+            let target = self.scroll_offset + inner_row;
+            let max = self.total_lines().saturating_sub(1);
+            self.cursor_line = target.min(max);
+            self.cursor_on_comment = None;
+        } else {
+            match self.row_map.get(inner_row) {
+                Some(VisualRowContent::CodeLine(idx)) => {
+                    self.cursor_line = *idx;
+                    self.cursor_on_comment = None;
+                }
+                Some(VisualRowContent::CommentRow(start, end)) => {
+                    self.cursor_line = end.saturating_sub(1); // 0-indexed
+                    self.cursor_on_comment = Some((*start, *end));
+                }
+                None => {
+                    // Click beyond rendered content — fallback to last code line
+                    let max = self.total_lines().saturating_sub(1);
+                    self.cursor_line = max;
+                    self.cursor_on_comment = None;
+                }
+            }
+        }
         true
     }
 
@@ -676,6 +777,7 @@ impl FileViewer {
 
                 let mut render_row: u16 = 0;
                 let max_rows = content_area.height;
+                self.row_map.clear();
 
                 for code_line_idx in self.scroll_offset..lines.len() {
                     if render_row >= max_rows {
@@ -728,15 +830,19 @@ impl FileViewer {
                     let in_line_select = self.line_select_range.map_or(false, |(s, e)| {
                         line_num >= s && line_num <= e
                     });
-                    let in_comment_range = self
+                    let comment_range_info = self
                         .comments
                         .iter()
-                        .any(|c| line_num >= c.start_line && line_num <= c.end_line);
+                        .find(|(c, _)| line_num >= c.start_line && line_num <= c.end_line);
+                    let in_comment_range = comment_range_info.is_some();
+                    let in_stale_comment = comment_range_info.map_or(false, |(_, s)| *s);
 
                     let highlight_bg = if focused && code_line_idx == self.cursor_line && self.cursor_on_comment.is_none() {
                         Some(Color::DarkGray)
                     } else if in_line_select {
                         Some(Color::DarkGray)
+                    } else if in_stale_comment {
+                        Some(Color::Indexed(52)) // dark red bg for stale comments
                     } else if in_comment_range {
                         Some(Color::Indexed(236)) // subtle dark bg (#303030)
                     } else {
@@ -753,6 +859,7 @@ impl FileViewer {
                         }
                     }
 
+                    self.row_map.push(VisualRowContent::CodeLine(code_line_idx));
                     render_row += 1;
 
                     // Render inline comment editor or existing comment block
@@ -764,19 +871,28 @@ impl FileViewer {
                     if editing_this_line {
                         // Inline editor takes priority over saved comment
                         if let Some(ref edit) = self.comment_edit {
+                            let before = render_row;
                             self.render_comment_editor(
                                 edit, content_area, buf, &mut render_row, max_rows,
                             );
+                            for _ in before..render_row {
+                                self.row_map.push(VisualRowContent::CommentRow(edit.start_line, edit.target_line));
+                            }
                         }
-                    } else if let Some(comment) = self.comment_at_end_line(line_num) {
+                    } else if let Some((comment, is_stale)) = self.comment_at_end_line(line_num) {
                         if render_row < max_rows {
                             // Check if cursor is on this comment row
                             let cursor_on_this = focused && self.cursor_on_comment
                                 .map_or(false, |(s, e)| s == comment.start_line && e == comment.end_line);
                             let comment_render_start = render_row;
+                            let c_start = comment.start_line;
+                            let c_end = comment.end_line;
                             self.render_comment_block(
-                                comment, content_area, buf, &mut render_row, max_rows,
+                                comment, is_stale, content_area, buf, &mut render_row, max_rows,
                             );
+                            for _ in comment_render_start..render_row {
+                                self.row_map.push(VisualRowContent::CommentRow(c_start, c_end));
+                            }
                             // Highlight all rows of the comment block when cursor is on it
                             if cursor_on_this {
                                 for r in comment_render_start..render_row {
@@ -799,23 +915,29 @@ impl FileViewer {
         }
     }
 
-    /// Render an inline comment block (2 rows: header + text).
+    /// Render an inline comment block (2 rows: header + separator).
     fn render_comment_block(
         &self,
         comment: &Comment,
+        is_stale: bool,
         inner: Rect,
         buf: &mut Buffer,
         render_row: &mut u16,
         max_rows: u16,
     ) {
-        let comment_style = Style::default().fg(Color::Cyan).bg(Color::Black);
+        let (icon, text_color, sep_color) = if is_stale {
+            ("\u{26a0}\u{fe0f}", Color::Yellow, Color::Yellow)
+        } else {
+            ("\u{1f4ac}", Color::Cyan, Color::DarkGray)
+        };
+        let comment_style = Style::default().fg(text_color).bg(Color::Black);
 
         // Row 1: range + comment text
         let range_str = if comment.start_line == comment.end_line {
-            format!("  💬 L{}: {}", comment.start_line, comment.text)
+            format!("  {icon} L{}: {}", comment.start_line, comment.text)
         } else {
             format!(
-                "  💬 L{}-{}: {}",
+                "  {icon} L{}-{}: {}",
                 comment.start_line, comment.end_line, comment.text
             )
         };
@@ -834,7 +956,7 @@ impl FileViewer {
         if *render_row < max_rows {
             let y = inner.y + *render_row;
             let sep = "─".repeat(inner.width as usize);
-            let line = Line::from(Span::styled(sep, Style::default().fg(Color::DarkGray)));
+            let line = Line::from(Span::styled(sep, Style::default().fg(sep_color)));
             buf.set_line(inner.x, y, &line, inner.width);
             *render_row += 1;
         }
@@ -928,6 +1050,7 @@ impl FileViewer {
                 MinimapMarker::Modified => Color::Yellow,
                 MinimapMarker::Removed => Color::Red,
                 MinimapMarker::Comment => Color::Cyan,
+                MinimapMarker::StaleComment => Color::Yellow,
             }
         }
 
@@ -1027,6 +1150,7 @@ impl FileViewer {
 
         let mut render_row: u16 = 0;
         let max_rows = inner.height;
+        self.row_map.clear();
 
         for (disp_idx, (orig_idx, diff_line)) in displayable
             .iter()
@@ -1110,6 +1234,7 @@ impl FileViewer {
                 }
             }
 
+            self.row_map.push(VisualRowContent::CodeLine(disp_idx));
             render_row += 1;
 
             // Render inline comment editor or existing comment block after this line
@@ -1121,18 +1246,27 @@ impl FileViewer {
 
                 if editing_this_line {
                     if let Some(ref edit) = self.comment_edit {
+                        let before = render_row;
                         self.render_comment_editor(
                             edit, inner, buf, &mut render_row, max_rows,
                         );
+                        for _ in before..render_row {
+                            self.row_map.push(VisualRowContent::CommentRow(edit.start_line, edit.target_line));
+                        }
                     }
-                } else if let Some(comment) = self.comment_at_end_line(ln) {
+                } else if let Some((comment, is_stale)) = self.comment_at_end_line(ln) {
                     if render_row < max_rows {
                         let cursor_on_this = self.cursor_on_comment
                             .map_or(false, |(s, e)| s == comment.start_line && e == comment.end_line);
                         let comment_render_start = render_row;
+                        let c_start = comment.start_line;
+                        let c_end = comment.end_line;
                         self.render_comment_block(
-                            comment, inner, buf, &mut render_row, max_rows,
+                            comment, is_stale, inner, buf, &mut render_row, max_rows,
                         );
+                        for _ in comment_render_start..render_row {
+                            self.row_map.push(VisualRowContent::CommentRow(c_start, c_end));
+                        }
                         if cursor_on_this {
                             for r in comment_render_start..render_row {
                                 let cy = inner.y + r;
@@ -1162,7 +1296,7 @@ impl FileViewer {
             // Check if there is a comment ending at the current file line.
             // If so, stop on the comment row instead of advancing cursor_line.
             if let Some(ln) = self.effective_file_line(self.cursor_line) {
-                if let Some(c) = self.comment_at_end_line(ln) {
+                if let Some((c, _)) = self.comment_at_end_line(ln) {
                     self.cursor_on_comment = Some((c.start_line, c.end_line));
                 } else {
                     self.cursor_line += 1;
@@ -1194,7 +1328,7 @@ impl FileViewer {
                 Some(self.cursor_line)
             };
             if let Some(ln) = check_line {
-                if let Some(c) = self.comment_at_end_line(ln) {
+                if let Some((c, _)) = self.comment_at_end_line(ln) {
                     self.cursor_on_comment = Some((c.start_line, c.end_line));
                     self.cursor_line -= 1;
                 } else {
@@ -1213,6 +1347,14 @@ impl FileViewer {
         match &self.content {
             ViewerContent::File { path, .. } => Some(path),
             _ => None,
+        }
+    }
+
+    /// Get the lines of the currently loaded file content.
+    pub fn current_lines(&self) -> &[String] {
+        match &self.content {
+            ViewerContent::File { lines, .. } => lines,
+            _ => &[],
         }
     }
 
@@ -2146,6 +2288,7 @@ mod tests {
             start_line: start,
             end_line: end,
             text: "test comment".into(),
+            code_context: vec![],
         }
     }
 
@@ -2156,7 +2299,7 @@ mod tests {
         let mut viewer = FileViewer::new();
         viewer.load_file(&path);
         // Add comment ending at line 3 (1-indexed)
-        viewer.comments = vec![make_comment(&path, 3, 3)];
+        viewer.comments = vec![(make_comment(&path, 3, 3), false)];
         viewer.cursor_line = 1; // 0-indexed, line 2 in 1-indexed
 
         // Move down: cursor_line is 1, comment ends at line 2 (cursor_line+1=2, but
@@ -2180,7 +2323,7 @@ mod tests {
         let (_tmp, path) = tmp_file("test.txt", &content);
         let mut viewer = FileViewer::new();
         viewer.load_file(&path);
-        viewer.comments = vec![make_comment(&path, 3, 3)];
+        viewer.comments = vec![(make_comment(&path, 3, 3), false)];
         viewer.cursor_line = 2; // 0-indexed
         viewer.cursor_on_comment = Some((3, 3));
 
@@ -2196,7 +2339,7 @@ mod tests {
         let (_tmp, path) = tmp_file("test.txt", &content);
         let mut viewer = FileViewer::new();
         viewer.load_file(&path);
-        viewer.comments = vec![make_comment(&path, 3, 3)];
+        viewer.comments = vec![(make_comment(&path, 3, 3), false)];
         viewer.cursor_line = 3; // 0-indexed, line 4 in 1-indexed
 
         // Move up: comment_at_end_line(cursor_line=3) → match (comment end_line=3)
@@ -2211,7 +2354,7 @@ mod tests {
         let (_tmp, path) = tmp_file("test.txt", &content);
         let mut viewer = FileViewer::new();
         viewer.load_file(&path);
-        viewer.comments = vec![make_comment(&path, 3, 3)];
+        viewer.comments = vec![(make_comment(&path, 3, 3), false)];
         viewer.cursor_line = 2;
         viewer.cursor_on_comment = Some((3, 3));
 
@@ -2349,7 +2492,7 @@ mod tests {
             ],
         });
         viewer.compute_diff_line_numbers();
-        viewer.comments = vec![make_comment(&path, 1, 1)]; // comment at file line 1
+        viewer.comments = vec![(make_comment(&path, 1, 1), false)]; // comment at file line 1
 
         viewer.cursor_line = 0; // on Context line (file line 1)
         // cursor_down should stop on comment (comment ends at file line 1)
@@ -2383,7 +2526,7 @@ mod tests {
             ],
         });
         viewer.compute_diff_line_numbers();
-        viewer.comments = vec![make_comment(&path, 1, 1)]; // comment at file line 1
+        viewer.comments = vec![(make_comment(&path, 1, 1), false)]; // comment at file line 1
 
         viewer.cursor_line = 1; // on Added line (file line 2)
         // cursor_up: previous line (disp 0) has file line 1, comment ends there → stop
@@ -2461,6 +2604,55 @@ mod tests {
     fn click_line_without_content_rect_returns_false() {
         let mut viewer = FileViewer::new();
         assert!(!viewer.click_line(5, 10));
+    }
+
+    #[test]
+    fn click_line_accounts_for_comment_rows() {
+        let content: Vec<u8> = (0..10).map(|i| format!("line {i}\n")).collect::<String>().into();
+        let (_tmp, path) = tmp_file("test.txt", &content);
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.visible_height = 20;
+        viewer.scroll_offset = 0;
+        viewer.content_rect = Some(Rect::new(0, 0, 80, 20));
+
+        // Simulate row_map as if line 2 (0-indexed) has a 2-row comment block after it:
+        // row 0 → CodeLine(0)
+        // row 1 → CodeLine(1)
+        // row 2 → CodeLine(2)
+        // row 3 → CommentRow(2, 3) ← comment header
+        // row 4 → CommentRow(2, 3) ← comment separator
+        // row 5 → CodeLine(3)
+        // row 6 → CodeLine(4)
+        viewer.row_map = vec![
+            VisualRowContent::CodeLine(0),
+            VisualRowContent::CodeLine(1),
+            VisualRowContent::CodeLine(2),
+            VisualRowContent::CommentRow(2, 3),
+            VisualRowContent::CommentRow(2, 3),
+            VisualRowContent::CodeLine(3),
+            VisualRowContent::CodeLine(4),
+        ];
+
+        // Click on visual row 5 → should land on CodeLine(3), not CodeLine(5)
+        assert!(viewer.click_line(5, 10));
+        assert_eq!(viewer.cursor_line, 3);
+        assert!(viewer.cursor_on_comment.is_none());
+
+        // Click on visual row 3 (comment header) → should set cursor_on_comment
+        assert!(viewer.click_line(3, 10));
+        assert_eq!(viewer.cursor_line, 2); // end_line(3) - 1 = 2, 0-indexed
+        assert_eq!(viewer.cursor_on_comment, Some((2, 3)));
+
+        // Click on visual row 0 → CodeLine(0)
+        assert!(viewer.click_line(0, 10));
+        assert_eq!(viewer.cursor_line, 0);
+        assert!(viewer.cursor_on_comment.is_none());
+
+        // Click beyond row_map → fallback to last code line
+        assert!(viewer.click_line(15, 10));
+        assert_eq!(viewer.cursor_line, 9); // 10 lines, max = 9
+        assert!(viewer.cursor_on_comment.is_none());
     }
 
     // --- Tests for scroll position preservation on diff/preview toggle ---
@@ -2641,7 +2833,7 @@ mod tests {
         let mut viewer = FileViewer::new();
         viewer.load_file(&path);
         // Range comment L2-L5 (1-indexed), renders after end_line=5
-        viewer.comments = vec![make_comment(&path, 2, 5)];
+        viewer.comments = vec![(make_comment(&path, 2, 5), false)];
         viewer.cursor_line = 3; // 0-indexed, 1-indexed line 4
 
         // Move down: no comment ends at line 4, so cursor moves to cursor_line=4 (line 5)
@@ -2668,6 +2860,37 @@ mod tests {
         viewer.cursor_up();
         assert!(viewer.cursor_on_comment.is_none());
         assert_eq!(viewer.cursor_line, 4);
+    }
+
+    #[test]
+    fn stale_comment_minimap_marker() {
+        let (_tmp, path) = tmp_file("test.txt", b"line1\nchanged\nline3\n");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+
+        // Fresh comment (code_context matches current content)
+        let fresh = Comment {
+            file: path.clone(),
+            start_line: 1,
+            end_line: 1,
+            text: "ok".into(),
+            code_context: vec!["line1".into()],
+        };
+        // Stale comment (code_context differs from current content)
+        let stale = Comment {
+            file: path.clone(),
+            start_line: 2,
+            end_line: 2,
+            text: "old".into(),
+            code_context: vec!["original_line2".into()],
+        };
+        viewer.comments = vec![(fresh, false), (stale, true)];
+
+        let markers = viewer.compute_minimap_markers(6);
+        // Line 1 (fresh) → MinimapMarker::Comment (Cyan)
+        assert_eq!(markers[0], Some(MinimapMarker::Comment));
+        // Line 2 (stale) → MinimapMarker::StaleComment (Yellow)
+        assert_eq!(markers[2], Some(MinimapMarker::StaleComment));
     }
 
 }
