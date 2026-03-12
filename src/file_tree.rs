@@ -133,75 +133,8 @@ impl FileTree {
         };
 
         // Comment list mode renders differently
-        if let Some(ref cl) = self.comment_list {
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style)
-                .title(" Comments ");
-            let inner = block.inner(area);
-            block.render(area, buf);
-
-            let visible_height = inner.height as usize;
-
-            for (i, entry) in cl
-                .entries
-                .iter()
-                .skip(cl.scroll_offset)
-                .take(visible_height)
-                .enumerate()
-            {
-                let global_idx = cl.scroll_offset + i;
-                let is_selected = global_idx == cl.selected;
-
-                let style = if is_selected {
-                    Style::default().fg(Color::Black).bg(Color::White)
-                } else if entry.is_header {
-                    Style::default().fg(Color::Yellow)
-                } else {
-                    Style::default()
-                };
-
-                let text = if entry.is_header {
-                    let prefix = "\u{25bc} ";
-                    let max_name = (inner.width as usize).saturating_sub(prefix.len());
-                    let name = &entry.display_name;
-                    if name.len() > max_name {
-                        let skip = name.len() - max_name.saturating_sub(1); // 1 for …
-                        format!("{prefix}\u{2026}{}", &name[skip..])
-                    } else {
-                        format!("{prefix}{name}")
-                    }
-                } else {
-                    let line_str = if entry.start_line == entry.end_line {
-                        format!(":{}", entry.start_line)
-                    } else {
-                        format!(":{}-{}", entry.start_line, entry.end_line)
-                    };
-                    // Truncate comment text to fit
-                    let max_text = (inner.width as usize).saturating_sub(line_str.len() + 4);
-                    let truncated = if entry.text.len() > max_text {
-                        format!("{}...", &entry.text[..max_text.saturating_sub(3)])
-                    } else {
-                        entry.text.clone()
-                    };
-                    format!("  {line_str} {truncated}")
-                };
-
-                let line = Line::from(Span::styled(text, style));
-                let y = inner.y + i as u16;
-                if y < inner.y + inner.height {
-                    buf.set_line(inner.x, y, &line, inner.width);
-                }
-            }
-
-            if cl.entries.is_empty() {
-                let msg = Line::from(Span::styled(
-                    "No comments",
-                    Style::default().fg(Color::DarkGray),
-                ));
-                buf.set_line(inner.x, inner.y, &msg, inner.width);
-            }
-
+        if self.comment_list.is_some() {
+            self.render_comment_list(area, buf, border_style);
             return;
         }
 
@@ -234,75 +167,7 @@ impl FileTree {
         {
             let global_idx = self.scroll_offset + i;
             let is_selected = global_idx == self.model.selected;
-
-            let indent = "  ".repeat(entry.depth);
-            let icon = if entry.is_directory {
-                if entry.is_expanded {
-                    "▼ "
-                } else {
-                    "▶ "
-                }
-            } else {
-                "  "
-            };
-
-            let style = if is_selected {
-                Style::default().fg(Color::Black).bg(Color::White)
-            } else if entry.is_gitignored {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                Style::default()
-            };
-
-            let name_text = format!("{indent}{icon}{}", entry.name());
-            let mut spans = vec![Span::styled(name_text, style)];
-
-            // Git status marker
-            let marker_info = if entry.is_directory {
-                if self.model.dir_has_changes(&entry.path) {
-                    Some((" [●]", Color::Yellow))
-                } else {
-                    None
-                }
-            } else {
-                entry.git_status.map(|fs| match fs {
-                    FileStatus::Modified => (" [M]", Color::Yellow),
-                    FileStatus::Added => (" [A]", Color::Green),
-                    FileStatus::Deleted => (" [D]", Color::Red),
-                    FileStatus::Renamed => (" [R]", Color::Blue),
-                    FileStatus::Untracked => (" [?]", Color::Green),
-                })
-            };
-
-            if let Some((marker, color)) = marker_info {
-                let marker_style = if is_selected {
-                    Style::default().fg(color).bg(Color::White)
-                } else if entry.is_gitignored {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default().fg(color)
-                };
-                spans.push(Span::styled(marker, marker_style));
-            }
-
-            // Comment indicator
-            let has_comments = if entry.is_directory {
-                commented_files.iter().any(|f| f.starts_with(&entry.path))
-            } else {
-                commented_files.contains(&entry.path)
-            };
-            if has_comments {
-                let comment_style = if is_selected {
-                    Style::default().fg(Color::Cyan).bg(Color::White)
-                } else if entry.is_gitignored {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default().fg(Color::Cyan)
-                };
-                spans.push(Span::styled(" [C]", comment_style));
-            }
-
-            let line = Line::from(spans);
+            let line = self.render_tree_entry(entry, is_selected, commented_files);
 
             let y = inner.y + i as u16;
             if y < inner.y + inner.height {
@@ -318,6 +183,156 @@ impl FileTree {
             ));
             buf.set_line(inner.x, inner.y, &msg, inner.width);
         }
+    }
+
+    /// Render the comment list overlay.
+    fn render_comment_list(&self, area: Rect, buf: &mut Buffer, border_style: Style) {
+        let cl = self.comment_list.as_ref().unwrap();
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style)
+            .title(" Comments ");
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let visible_height = inner.height as usize;
+
+        for (i, entry) in cl
+            .entries
+            .iter()
+            .skip(cl.scroll_offset)
+            .take(visible_height)
+            .enumerate()
+        {
+            let global_idx = cl.scroll_offset + i;
+            let is_selected = global_idx == cl.selected;
+
+            let style = if is_selected {
+                Style::default().fg(Color::Black).bg(Color::White)
+            } else if entry.is_header {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+
+            let text = if entry.is_header {
+                let prefix = "\u{25bc} ";
+                let max_name = (inner.width as usize).saturating_sub(prefix.len());
+                let name = &entry.display_name;
+                if name.len() > max_name {
+                    let skip = name.len() - max_name.saturating_sub(1); // 1 for …
+                    format!("{prefix}\u{2026}{}", &name[skip..])
+                } else {
+                    format!("{prefix}{name}")
+                }
+            } else {
+                let line_str = if entry.start_line == entry.end_line {
+                    format!(":{}", entry.start_line)
+                } else {
+                    format!(":{}-{}", entry.start_line, entry.end_line)
+                };
+                // Truncate comment text to fit
+                let max_text = (inner.width as usize).saturating_sub(line_str.len() + 4);
+                let truncated = if entry.text.len() > max_text {
+                    format!("{}...", &entry.text[..max_text.saturating_sub(3)])
+                } else {
+                    entry.text.clone()
+                };
+                format!("  {line_str} {truncated}")
+            };
+
+            let line = Line::from(Span::styled(text, style));
+            let y = inner.y + i as u16;
+            if y < inner.y + inner.height {
+                buf.set_line(inner.x, y, &line, inner.width);
+            }
+        }
+
+        if cl.entries.is_empty() {
+            let msg = Line::from(Span::styled(
+                "No comments",
+                Style::default().fg(Color::DarkGray),
+            ));
+            buf.set_line(inner.x, inner.y, &msg, inner.width);
+        }
+    }
+
+    /// Build a Line with icon, name, git status marker, and comment indicator for one entry.
+    fn render_tree_entry(
+        &self,
+        entry: &TreeEntry,
+        is_selected: bool,
+        commented_files: &HashSet<PathBuf>,
+    ) -> Line<'static> {
+        let indent = "  ".repeat(entry.depth);
+        let icon = if entry.is_directory {
+            if entry.is_expanded {
+                "▼ "
+            } else {
+                "▶ "
+            }
+        } else {
+            "  "
+        };
+
+        let style = if is_selected {
+            Style::default().fg(Color::Black).bg(Color::White)
+        } else if entry.is_gitignored {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+
+        let name_text = format!("{indent}{icon}{}", entry.name());
+        let mut spans = vec![Span::styled(name_text, style)];
+
+        // Git status marker
+        let marker_info = if entry.is_directory {
+            if self.model.dir_has_changes(&entry.path) {
+                Some((" [●]", Color::Yellow))
+            } else {
+                None
+            }
+        } else {
+            entry.git_status.map(|fs| match fs {
+                FileStatus::Modified => (" [M]", Color::Yellow),
+                FileStatus::Added => (" [A]", Color::Green),
+                FileStatus::Deleted => (" [D]", Color::Red),
+                FileStatus::Renamed => (" [R]", Color::Blue),
+                FileStatus::Untracked => (" [?]", Color::Green),
+            })
+        };
+
+        if let Some((marker, color)) = marker_info {
+            let marker_style = if is_selected {
+                Style::default().fg(color).bg(Color::White)
+            } else if entry.is_gitignored {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default().fg(color)
+            };
+            spans.push(Span::styled(marker, marker_style));
+        }
+
+        // Comment indicator
+        let has_comments = if entry.is_directory {
+            commented_files.iter().any(|f| f.starts_with(&entry.path))
+        } else {
+            commented_files.contains(&entry.path)
+        };
+        if has_comments {
+            let comment_style = if is_selected {
+                Style::default().fg(Color::Cyan).bg(Color::White)
+            } else if entry.is_gitignored {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            spans.push(Span::styled(" [C]", comment_style));
+        }
+
+        Line::from(spans)
     }
 
     /// Scroll tree viewport down by `lines`, clamping to max scroll position.
