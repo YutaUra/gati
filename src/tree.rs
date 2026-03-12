@@ -130,13 +130,7 @@ impl FileTreeModel {
     /// Build a new tree model from a root directory. The root is expanded by default.
     pub fn from_dir(root: &Path, git_status: Option<GitStatus>) -> anyhow::Result<Self> {
         let mut entries = scan_dir(root, 0)?;
-        if let Some(ref gs) = git_status {
-            inject_deleted_files(&mut entries, gs, root, 0);
-        }
-        sort_entries(&mut entries);
-        if let Some(ref gs) = git_status {
-            annotate_entries(&mut entries, gs);
-        }
+        prepare_entries(&mut entries, git_status.as_ref(), root, 0, false);
         Ok(Self {
             entries,
             selected: 0,
@@ -172,18 +166,13 @@ impl FileTreeModel {
             let path = entry.path.clone();
             let child_depth = entry.depth + 1;
             let mut children = scan_dir(&path, child_depth)?;
-
-            if let Some(ref gs) = self.git_status {
-                inject_deleted_files(&mut children, gs, &path, child_depth);
-            }
-            sort_entries(&mut children);
-
-            if let Some(ref gs) = self.git_status {
-                annotate_entries(&mut children, gs);
-                if self.filter_changed {
-                    filter_changed_entries(&mut children, gs);
-                }
-            }
+            prepare_entries(
+                &mut children,
+                self.git_status.as_ref(),
+                &path,
+                child_depth,
+                self.filter_changed,
+            );
 
             self.entries[self.selected].is_expanded = true;
             let insert_pos = self.selected + 1;
@@ -279,16 +268,13 @@ impl FileTreeModel {
 
         // Rescan root (git status is NOT refreshed here; use update_git_status() separately)
         let mut entries = scan_dir(&self.root, 0)?;
-        if let Some(ref gs) = self.git_status {
-            inject_deleted_files(&mut entries, gs, &self.root, 0);
-        }
-        sort_entries(&mut entries);
-        if let Some(ref gs) = self.git_status {
-            annotate_entries(&mut entries, gs);
-            if self.filter_changed {
-                filter_changed_entries(&mut entries, gs);
-            }
-        }
+        prepare_entries(
+            &mut entries,
+            self.git_status.as_ref(),
+            &self.root,
+            0,
+            self.filter_changed,
+        );
 
         // Re-expand previously expanded directories (depth-first)
         let mut i = 0;
@@ -297,16 +283,13 @@ impl FileTreeModel {
                 let path = entries[i].path.clone();
                 let child_depth = entries[i].depth + 1;
                 let mut children = scan_dir(&path, child_depth)?;
-                if let Some(ref gs) = self.git_status {
-                    inject_deleted_files(&mut children, gs, &path, child_depth);
-                }
-                sort_entries(&mut children);
-                if let Some(ref gs) = self.git_status {
-                    annotate_entries(&mut children, gs);
-                    if self.filter_changed {
-                        filter_changed_entries(&mut children, gs);
-                    }
-                }
+                prepare_entries(
+                    &mut children,
+                    self.git_status.as_ref(),
+                    &path,
+                    child_depth,
+                    self.filter_changed,
+                );
                 entries[i].is_expanded = true;
                 let insert_pos = i + 1;
                 for (j, child) in children.into_iter().enumerate() {
@@ -339,16 +322,13 @@ impl FileTreeModel {
 
         // Rebuild root-level entries
         let mut entries = scan_dir(&self.root, 0)?;
-        if let Some(ref gs) = self.git_status {
-            inject_deleted_files(&mut entries, gs, &self.root, 0);
-        }
-        sort_entries(&mut entries);
-        if let Some(ref gs) = self.git_status {
-            annotate_entries(&mut entries, gs);
-            if self.filter_changed {
-                filter_changed_entries(&mut entries, gs);
-            }
-        }
+        prepare_entries(
+            &mut entries,
+            self.git_status.as_ref(),
+            &self.root,
+            0,
+            self.filter_changed,
+        );
         self.entries = entries;
 
         // Restore selection or reset to first entry
@@ -439,6 +419,28 @@ pub fn search_files(root: &Path, query: &str) -> anyhow::Result<Vec<TreeEntry>> 
     }
 
     Ok(entries)
+}
+
+/// Post-process scanned entries: inject deleted files, sort, annotate git status,
+/// and optionally filter to changed-only. This is the shared pipeline used by
+/// `from_dir`, `toggle_expand`, `refresh_tree`, and `toggle_filter`.
+fn prepare_entries(
+    entries: &mut Vec<TreeEntry>,
+    gs: Option<&GitStatus>,
+    dir: &Path,
+    depth: usize,
+    filter_changed: bool,
+) {
+    if let Some(gs) = gs {
+        inject_deleted_files(entries, gs, dir, depth);
+    }
+    sort_entries(entries);
+    if let Some(gs) = gs {
+        annotate_entries(entries, gs);
+        if filter_changed {
+            filter_changed_entries(entries, gs);
+        }
+    }
 }
 
 /// Filter entries to only include files with git changes and directories containing changes.
