@@ -16,7 +16,7 @@ rustPlatform.buildRustPackage {
     owner = "YutaUra";
     repo = "gati";
     rev = "v${version}";
-    hash = "sha256-FLEl9WGP2rstN/7dCsbShtptQPC4XTHrxuHSontx/ZE=";
+    hash = "sha256-YA3msyewNNducGYfRS/4z03gOkvUFnEzsExE4G2X1yo=";
   };
 
   cargoHash = "sha256-zqBSkEcNp21x8Ub0WtVlXLiFsTGlu5PFb3J6oLR54R4=";
