@@ -17,6 +17,12 @@
         pkgs = import nixpkgs { inherit system overlays; };
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "rust-analyzer" ];
+          targets = [
+            "aarch64-apple-darwin"
+            "x86_64-apple-darwin"
+            "x86_64-unknown-linux-gnu"
+            "aarch64-unknown-linux-gnu"
+          ];
         };
       in
       {
@@ -26,6 +32,10 @@
             rustToolchain
             pkgs.pkg-config
             pkgs.cmake
+
+            # Cross-compilation
+            pkgs.zig
+            pkgs.cargo-zigbuild
 
             # Node.js (for OpenSpec, requires >=20.19.0)
             pkgs.nodejs
