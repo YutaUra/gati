@@ -758,86 +758,9 @@ fn start_mouse_line_select(app: &mut App) {
 fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent, terminal_width: u16) {
     use crossterm::event::{MouseButton, MouseEventKind};
 
-    let min_cols = (terminal_width * MIN_PANE_PERCENT / 100).max(MIN_PANE_COLS);
-
     match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            let border = app.border_column;
-            if app.focus_mode {
-                // In focus mode, clicking near left edge (col 0-1) starts drag-to-restore
-                if mouse.column <= 1 {
-                    app.resizing = true;
-                }
-            } else if mouse.column.abs_diff(border) <= 1 {
-                app.resizing = true;
-            } else if mouse.column < border {
-                app.focus = Focus::Tree;
-                // Click-to-select tree entry
-                if mouse.row >= app.tree_inner_y {
-                    let inner_row = (mouse.row - app.tree_inner_y) as usize;
-                    let entry_idx = app.file_tree.scroll_offset + inner_row;
-                    if entry_idx < app.file_tree.model.entries.len() {
-                        app.file_tree.model.selected = entry_idx;
-                        if app.file_tree.model.entries[entry_idx].is_directory {
-                            let _ = app.file_tree.model.toggle_expand();
-                        } else {
-                            let path = app.file_tree.model.entries[entry_idx].path.clone();
-                            app.file_viewer.load_file(&path);
-                            if let Some(ref workdir) = app.git_workdir {
-                                let line_diff = diff::compute_line_diff(workdir, &path);
-                                let unified_diff = diff::compute_unified_diff(workdir, &path);
-                                app.file_viewer.set_diff(line_diff, unified_diff);
-                            }
-                        }
-                    }
-                }
-            } else if let Some(mr) = app.file_viewer.minimap_rect {
-                if mouse.column >= mr.x
-                    && mouse.column < mr.x + mr.width
-                    && mouse.row >= mr.y
-                    && mouse.row < mr.y + mr.height
-                {
-                    // Click on minimap: scroll to corresponding file position
-                    app.focus = Focus::Viewer;
-                    let row_in_minimap = mouse.row - mr.y;
-                    app.file_viewer
-                        .scroll_to_minimap_row(row_in_minimap, mr.height);
-                } else {
-                    app.focus = Focus::Viewer;
-                    if app.file_viewer.click_line(mouse.row, mouse.column) {
-                        start_mouse_line_select(app);
-                    }
-                }
-            } else {
-                app.focus = Focus::Viewer;
-                if app.file_viewer.click_line(mouse.row, mouse.column) {
-                    start_mouse_line_select(app);
-                }
-            }
-        }
-        MouseEventKind::Drag(MouseButton::Left) => {
-            if app.resizing {
-                if app.focus_mode {
-                    // Drag-to-restore: exit focus mode when dragged past min_cols
-                    if mouse.column >= min_cols {
-                        app.focus_mode = false;
-                        app.tree_width_percent = clamp_tree_percent(mouse.column, terminal_width);
-                    }
-                } else {
-                    // Drag-to-collapse: enter focus mode when dragged below min_cols
-                    if mouse.column < min_cols {
-                        app.saved_tree_width_percent = app.tree_width_percent;
-                        app.focus_mode = true;
-                        app.focus = Focus::Viewer;
-                    } else {
-                        app.tree_width_percent = clamp_tree_percent(mouse.column, terminal_width);
-                    }
-                }
-            } else if matches!(app.input_mode, InputMode::LineSelect { .. }) {
-                // Extend line selection by moving cursor to dragged row
-                app.file_viewer.click_line(mouse.row, mouse.column);
-            }
-        }
+        MouseEventKind::Down(MouseButton::Left) => handle_mouse_click(app, mouse),
+        MouseEventKind::Drag(MouseButton::Left) => handle_mouse_drag(app, mouse, terminal_width),
         MouseEventKind::Up(MouseButton::Left) => {
             app.resizing = false;
             // If line-select range is a single line (no drag), cancel selection
@@ -881,6 +804,89 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent, terminal_wid
             }
         }
         _ => {}
+    }
+}
+
+/// Handle left-click: start resize drag, select tree entry, click minimap, or click content.
+fn handle_mouse_click(app: &mut App, mouse: crossterm::event::MouseEvent) {
+    let border = app.border_column;
+    if app.focus_mode {
+        // In focus mode, clicking near left edge (col 0-1) starts drag-to-restore
+        if mouse.column <= 1 {
+            app.resizing = true;
+        }
+    } else if mouse.column.abs_diff(border) <= 1 {
+        app.resizing = true;
+    } else if mouse.column < border {
+        app.focus = Focus::Tree;
+        // Click-to-select tree entry
+        if mouse.row >= app.tree_inner_y {
+            let inner_row = (mouse.row - app.tree_inner_y) as usize;
+            let entry_idx = app.file_tree.scroll_offset + inner_row;
+            if entry_idx < app.file_tree.model.entries.len() {
+                app.file_tree.model.selected = entry_idx;
+                if app.file_tree.model.entries[entry_idx].is_directory {
+                    let _ = app.file_tree.model.toggle_expand();
+                } else {
+                    let path = app.file_tree.model.entries[entry_idx].path.clone();
+                    app.file_viewer.load_file(&path);
+                    if let Some(ref workdir) = app.git_workdir {
+                        let line_diff = diff::compute_line_diff(workdir, &path);
+                        let unified_diff = diff::compute_unified_diff(workdir, &path);
+                        app.file_viewer.set_diff(line_diff, unified_diff);
+                    }
+                }
+            }
+        }
+    } else if let Some(mr) = app.file_viewer.minimap_rect {
+        if mouse.column >= mr.x
+            && mouse.column < mr.x + mr.width
+            && mouse.row >= mr.y
+            && mouse.row < mr.y + mr.height
+        {
+            // Click on minimap: scroll to corresponding file position
+            app.focus = Focus::Viewer;
+            let row_in_minimap = mouse.row - mr.y;
+            app.file_viewer
+                .scroll_to_minimap_row(row_in_minimap, mr.height);
+        } else {
+            app.focus = Focus::Viewer;
+            if app.file_viewer.click_line(mouse.row, mouse.column) {
+                start_mouse_line_select(app);
+            }
+        }
+    } else {
+        app.focus = Focus::Viewer;
+        if app.file_viewer.click_line(mouse.row, mouse.column) {
+            start_mouse_line_select(app);
+        }
+    }
+}
+
+/// Handle left-drag: resize pane border or extend line selection.
+fn handle_mouse_drag(app: &mut App, mouse: crossterm::event::MouseEvent, terminal_width: u16) {
+    let min_cols = (terminal_width * MIN_PANE_PERCENT / 100).max(MIN_PANE_COLS);
+
+    if app.resizing {
+        if app.focus_mode {
+            // Drag-to-restore: exit focus mode when dragged past min_cols
+            if mouse.column >= min_cols {
+                app.focus_mode = false;
+                app.tree_width_percent = clamp_tree_percent(mouse.column, terminal_width);
+            }
+        } else {
+            // Drag-to-collapse: enter focus mode when dragged below min_cols
+            if mouse.column < min_cols {
+                app.saved_tree_width_percent = app.tree_width_percent;
+                app.focus_mode = true;
+                app.focus = Focus::Viewer;
+            } else {
+                app.tree_width_percent = clamp_tree_percent(mouse.column, terminal_width);
+            }
+        }
+    } else if matches!(app.input_mode, InputMode::LineSelect { .. }) {
+        // Extend line selection by moving cursor to dragged row
+        app.file_viewer.click_line(mouse.row, mouse.column);
     }
 }
 
