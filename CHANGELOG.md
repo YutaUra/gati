@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-03-12
+
+### Added
+
+- `Ctrl+C` to quit from any mode (help dialog, comment input, line select)
+- Homebrew install via `brew install YutaUra/tap/gati`
+- Nix flake install via `nix profile install github:YutaUra/gati`
+- Homebrew formula auto-update workflow (daily polling for new releases)
+
+### Fixed
+
+- Terminal size reported as 0x0 in multi-layer PTY setups (e.g. zellij → kubectl exec → container); now retries for up to 2 seconds before giving up
+- Terminal resize events (`Event::Resize`) are now explicitly handled in the event loop
+
 ## [0.4.0] - 2026-03-12
 
 ### Added
