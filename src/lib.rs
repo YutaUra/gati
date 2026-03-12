@@ -4,3 +4,4 @@
 
 pub mod git_status;
 pub mod tree;
+pub mod unicode;

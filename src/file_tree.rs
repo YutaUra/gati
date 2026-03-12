@@ -14,6 +14,7 @@ use ratatui::{
 use crate::components::{Action, Component};
 use crate::git_status::{FileStatus, GitStatus};
 use crate::tree::{self, FileTreeModel, TreeEntry};
+use crate::unicode;
 
 /// Entry in the comment list display.
 #[derive(Debug, Clone)]
@@ -220,9 +221,11 @@ impl FileTree {
                 let prefix = "\u{25bc} ";
                 let max_name = (inner.width as usize).saturating_sub(prefix.len());
                 let name = &entry.display_name;
-                if name.len() > max_name {
-                    let skip = name.len() - max_name.saturating_sub(1); // 1 for …
-                    format!("{prefix}\u{2026}{}", &name[skip..])
+                if name.chars().count() > max_name {
+                    let char_count = name.chars().count();
+                    let skip_chars = char_count.saturating_sub(max_name.saturating_sub(1));
+                    let byte_offset = unicode::char_skip_byte_offset(name, skip_chars);
+                    format!("{prefix}\u{2026}{}", &name[byte_offset..])
                 } else {
                     format!("{prefix}{name}")
                 }
@@ -235,7 +238,8 @@ impl FileTree {
                 // Truncate comment text to fit
                 let max_text = (inner.width as usize).saturating_sub(line_str.len() + 4);
                 let truncated = if entry.text.len() > max_text {
-                    format!("{}...", &entry.text[..max_text.saturating_sub(3)])
+                    let end = unicode::floor_char_boundary(&entry.text, max_text.saturating_sub(3));
+                    format!("{}...", &entry.text[..end])
                 } else {
                     entry.text.clone()
                 };

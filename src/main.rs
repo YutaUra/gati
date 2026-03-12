@@ -8,6 +8,7 @@ mod file_viewer;
 mod git_status;
 mod highlight;
 mod tree;
+mod unicode;
 mod watcher;
 
 use std::path::PathBuf;

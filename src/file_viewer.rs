@@ -14,6 +14,7 @@ use syntect::parsing::ParseState;
 
 use crate::comments::Comment;
 use crate::components::{Action, Component};
+use crate::unicode;
 
 use crate::diff::{DiffLineKind, LineDiff, UnifiedDiff, UnifiedDiffLine};
 use crate::highlight::Highlighter;
@@ -993,9 +994,13 @@ impl FileViewer {
         let prefix_width = prefix.chars().count();
         let available = (inner.width as usize).saturating_sub(prefix_width + 1); // +1 for cursor
 
-        // Truncate text from the left if it exceeds available width
-        let display_text = if edit.text.len() > available {
-            &edit.text[edit.text.len() - available..]
+        // Truncate text from the left if it exceeds available width.
+        // Use char_skip_byte_offset to avoid splitting multi-byte characters.
+        let text_char_count = edit.text.chars().count();
+        let display_text = if text_char_count > available {
+            let skip_chars = text_char_count - available;
+            let byte_offset = unicode::char_skip_byte_offset(&edit.text, skip_chars);
+            &edit.text[byte_offset..]
         } else {
             &edit.text
         };

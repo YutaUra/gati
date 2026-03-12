@@ -1,5 +1,7 @@
 use std::fmt::Write;
 
+use crate::unicode;
+
 const REPO_URL: &str = "https://github.com/YutaUra/gati";
 const MAX_URL_LEN: usize = 8000;
 
@@ -107,7 +109,8 @@ pub fn build_panic_url(crash_log: &str) -> String {
 
     // Extract a short title from the first line of the crash log
     let first_line = crash_log.lines().next().unwrap_or("unknown panic");
-    let title = format!("crash: {}", &first_line[..first_line.len().min(60)]);
+    let end = unicode::floor_char_boundary(first_line, 60);
+    let title = format!("crash: {}", &first_line[..end]);
     build_issue_url(&title, &body_content, &["bug", "crash"])
 }
 
@@ -134,6 +137,7 @@ fn build_url_with_truncation(base: &str, title: &str, body: &str) -> String {
     let mut truncated = body.to_string();
     while format_issue_url(base, title, &truncated).len() > MAX_URL_LEN && !truncated.is_empty() {
         let new_len = truncated.len() * 9 / 10;
+        let new_len = unicode::floor_char_boundary(&truncated, new_len);
         truncated.truncate(new_len);
     }
     if !truncated.is_empty() && truncated.len() < body.len() {
@@ -283,6 +287,43 @@ mod tests {
     fn url_encode_handles_special_chars() {
         assert_eq!(url_encode("hello world"), "hello+world");
         assert_eq!(url_encode("a&b=c"), "a%26b%3Dc");
+    }
+
+    #[test]
+    fn panic_url_with_japanese_message_does_not_panic() {
+        // Japanese text uses 3-byte UTF-8 sequences; slicing at arbitrary
+        // byte positions would panic without char-boundary-safe handling.
+        let crash_log = "panicked at 'インデックスが範囲外です: 長さ5のところにインデックス10', src/app.rs:42:10";
+        let url = build_panic_url(crash_log);
+        assert!(url.contains("crash"));
+        assert!(url.len() <= MAX_URL_LEN);
+    }
+
+    #[test]
+    fn panic_url_with_emoji_message_does_not_panic() {
+        let crash_log = "\u{1f4a5}\u{1f525} fatal error in render loop \u{1f4a5}";
+        let url = build_panic_url(crash_log);
+        assert!(url.contains("crash"));
+    }
+
+    #[test]
+    fn build_url_truncation_with_multibyte_body() {
+        // A body composed entirely of 3-byte Japanese characters; truncation
+        // at 90% of byte length must land on a char boundary.
+        let japanese_body = "あ".repeat(5000); // 15000 bytes
+        let url = build_url("Bug", &japanese_body);
+        assert!(url.len() <= MAX_URL_LEN);
+    }
+
+    #[test]
+    fn panic_url_title_truncated_within_japanese_text() {
+        // A first line longer than 60 bytes made of Japanese chars.
+        // Each char is 3 bytes, so 30 chars = 90 bytes > 60 byte limit.
+        let long_japanese = "あ".repeat(30);
+        let crash_log = format!("panicked at '{}'", long_japanese);
+        let url = build_panic_url(&crash_log);
+        // Should not panic and title should be truncated
+        assert!(url.contains("crash"));
     }
 
     /// Rough URL decode for test assertions (handles + and %XX).
