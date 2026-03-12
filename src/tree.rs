@@ -380,7 +380,7 @@ pub fn search_files(root: &Path, query: &str) -> anyhow::Result<Vec<TreeEntry>> 
         if path == root {
             continue;
         }
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
         let name = path
@@ -428,7 +428,7 @@ pub fn search_files(root: &Path, query: &str) -> anyhow::Result<Vec<TreeEntry>> 
             .map(|rel| rel.components().count() - 1)
             .unwrap_or(0);
 
-        let is_dir = entry.file_type().map_or(false, |ft| ft.is_dir());
+        let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
         if is_dir {
             let mut e = TreeEntry::directory(path, depth);
             e.is_expanded = true;

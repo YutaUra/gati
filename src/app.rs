@@ -168,8 +168,8 @@ impl App {
             }
         } else {
             // Auto-preview the first file if cursor starts on a file
-            if let Some(entry) = file_tree.model.selected_entry() {
-                if !entry.is_directory {
+            if let Some(entry) = file_tree.model.selected_entry()
+                && !entry.is_directory {
                     let path = entry.path.clone();
                     file_viewer.load_file(&path);
                     if let Some(ref workdir) = git_workdir {
@@ -178,7 +178,6 @@ impl App {
                         file_viewer.set_diff(line_diff, unified_diff);
                     }
                 }
-            }
         }
 
         Ok(Self {
@@ -248,15 +247,14 @@ impl App {
                 }
             }
             Action::StartLineSelect => {
-                if let Some(file) = self.file_viewer.current_file() {
-                    if let Some(line) = self.file_viewer.cursor_file_line() {
+                if let Some(file) = self.file_viewer.current_file()
+                    && let Some(line) = self.file_viewer.cursor_file_line() {
                         let file = file.to_path_buf();
                         self.input_mode = InputMode::LineSelect {
                             file,
                             anchor: line,
                         };
                     }
-                }
             }
             Action::DeleteComment => {
                 if let Some(file) = self.file_viewer.current_file() {
@@ -618,19 +616,17 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<(
         }
 
         // Check if background git status computation has completed
-        if let Some(ref worker) = app.git_worker {
-            if let Some(git_status) = worker.try_recv() {
+        if let Some(ref worker) = app.git_worker
+            && let Some(git_status) = worker.try_recv() {
                 app.file_tree.model.update_git_status(git_status);
                 app.git_worker = None;
             }
-        }
 
         // Refresh tree, git status, and diff when the watcher detects file-system changes
-        if let Some(ref watcher) = fs_watcher {
-            if watcher.has_changed() {
+        if let Some(ref watcher) = fs_watcher
+            && watcher.has_changed() {
                 app.refresh_on_fs_change();
             }
-        }
     }
 }
 
@@ -640,13 +636,12 @@ fn extract_code_context(
     start_line: usize,
     end_line: usize,
 ) -> Vec<String> {
-    if let crate::file_viewer::ViewerContent::File { path, lines, .. } = content {
-        if path == file {
+    if let crate::file_viewer::ViewerContent::File { path, lines, .. } = content
+        && path == file {
             let start = start_line.saturating_sub(1).min(lines.len());
             let end = end_line.min(lines.len());
             return lines[start..end].to_vec();
         }
-    }
     vec![]
 }
 
@@ -662,14 +657,12 @@ fn handle_comment_input(app: &mut App, key: crossterm::event::KeyEvent) {
                 end_line,
                 ref text,
             } = app.input_mode
-            {
-                if !text.is_empty() {
+                && !text.is_empty() {
                     let code_context =
                         extract_code_context(&app.file_viewer.content, file, start_line, end_line);
                     app.comment_store
                         .add(file, start_line, end_line, text.clone(), code_context);
                 }
-            }
             app.input_mode = InputMode::Normal;
             app.refresh_comment_list();
         }
@@ -749,12 +742,11 @@ fn toggle_focus_mode(app: &mut App) {
 /// Enter LineSelect mode anchored at the current cursor position.
 /// Called on mouse-down in the viewer content area.
 fn start_mouse_line_select(app: &mut App) {
-    if let Some(file) = app.file_viewer.current_file() {
-        if let Some(line) = app.file_viewer.cursor_file_line() {
+    if let Some(file) = app.file_viewer.current_file()
+        && let Some(line) = app.file_viewer.cursor_file_line() {
             let file = file.to_path_buf();
             app.input_mode = InputMode::LineSelect { file, anchor: line };
         }
-    }
 }
 
 fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent, terminal_width: u16) {
@@ -995,11 +987,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     // Clear expired flash messages
-    if let Some((_, _, created)) = &app.flash_message {
-        if created.elapsed() >= FLASH_DURATION {
+    if let Some((_, _, created)) = &app.flash_message
+        && created.elapsed() >= FLASH_DURATION {
             app.flash_message = None;
         }
-    }
 
     // Render key hint bar (or comment input)
     let (hints, hint_color): (String, Color) = match &app.input_mode {

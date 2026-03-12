@@ -408,11 +408,10 @@ impl FileTree {
 
         self.model.selected = new_idx;
 
-        if let Some(entry) = self.model.selected_entry() {
-            if !entry.is_directory {
+        if let Some(entry) = self.model.selected_entry()
+            && !entry.is_directory {
                 return Action::FileSelected(entry.path.clone());
             }
-        }
         Action::None
     }
 
@@ -484,7 +483,7 @@ impl FileTree {
         let mut entries = tree::search_files(&search.root, &search.query)?;
 
         // Annotate with git status if available
-        if let Some(ref gs) = self.model.git_status_ref() {
+        if let Some(gs) = self.model.git_status_ref() {
             for entry in entries.iter_mut() {
                 if !entry.is_directory {
                     entry.git_status = gs.file_status(&entry.path);
@@ -652,11 +651,11 @@ impl Component for FileTree {
                 Ok(action)
             }
             (KeyCode::Char('l'), KeyModifiers::NONE) | (KeyCode::Right, _) => {
-                if let Some(entry) = self.model.selected_entry() {
-                    if entry.is_directory {
+                if let Some(entry) = self.model.selected_entry()
+                    && entry.is_directory {
                         let is_double_tap = self
                             .last_expand_time
-                            .map_or(false, |t| t.elapsed() < DOUBLE_TAP_THRESHOLD);
+                            .is_some_and(|t| t.elapsed() < DOUBLE_TAP_THRESHOLD);
                         if !entry.is_expanded {
                             self.model.toggle_expand()?;
                             self.last_expand_time = Some(Instant::now());
@@ -669,14 +668,13 @@ impl Component for FileTree {
                             self.last_expand_time = Some(Instant::now());
                         }
                     }
-                }
                 Ok(Action::None)
             }
             (KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Left, _) => {
                 if let Some(entry) = self.model.selected_entry() {
                     let is_double_tap = self
                         .last_collapse_time
-                        .map_or(false, |t| t.elapsed() < DOUBLE_TAP_THRESHOLD);
+                        .is_some_and(|t| t.elapsed() < DOUBLE_TAP_THRESHOLD);
                     if entry.is_directory && entry.is_expanded {
                         self.model.toggle_expand()?;
                         self.last_collapse_time = Some(Instant::now());
@@ -694,12 +692,11 @@ impl Component for FileTree {
                 Ok(Action::None)
             }
             (KeyCode::Enter, _) => {
-                if let Some(entry) = self.model.selected_entry() {
-                    if !entry.is_directory {
+                if let Some(entry) = self.model.selected_entry()
+                    && !entry.is_directory {
                         let path = entry.path.clone();
                         return Ok(Action::FileOpened(path));
                     }
-                }
                 Ok(Action::None)
             }
             (KeyCode::Char('/'), KeyModifiers::NONE) => {

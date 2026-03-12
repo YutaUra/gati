@@ -27,7 +27,7 @@ impl Comment {
         for i in 0..=(current_lines.len() - ctx.len()) {
             if current_lines[i..i + ctx.len()] == *ctx.as_slice() {
                 let dist = (i as isize - original as isize).unsigned_abs();
-                if best.map_or(true, |(d, _)| dist < d) {
+                if best.is_none_or(|(d, _)| dist < d) {
                     best = Some((dist, i));
                 }
             }

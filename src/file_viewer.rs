@@ -550,11 +550,10 @@ impl FileViewer {
                         DiffLineKind::Modified => Some(MinimapMarker::Modified),
                         DiffLineKind::Unchanged => None,
                     };
-                    if let Some(m) = marker {
-                        if !matches!(markers[row], Some(MinimapMarker::Comment | MinimapMarker::StaleComment)) {
+                    if let Some(m) = marker
+                        && !matches!(markers[row], Some(MinimapMarker::Comment | MinimapMarker::StaleComment)) {
                             markers[row] = Some(m);
                         }
-                    }
                 }
             }
         }
@@ -779,7 +778,7 @@ impl FileViewer {
                 let max_rows = content_area.height;
                 self.row_map.clear();
 
-                for code_line_idx in self.scroll_offset..lines.len() {
+                for (code_line_idx, code_line) in lines.iter().enumerate().skip(self.scroll_offset) {
                     if render_row >= max_rows {
                         break;
                     }
@@ -813,7 +812,7 @@ impl FileViewer {
                     let highlighted = if code_line_idx < self.highlighted_lines.len() {
                         self.highlighted_lines[code_line_idx].clone()
                     } else {
-                        vec![Span::raw(lines[code_line_idx].clone())]
+                        vec![Span::raw(code_line.clone())]
                     };
                     if self.h_scroll > 0 {
                         spans.extend(skip_chars_in_spans(highlighted, self.h_scroll));
@@ -827,7 +826,7 @@ impl FileViewer {
                     buf.set_line(content_area.x, y, &line, content_area.width);
 
                     // Determine background highlight for this line
-                    let in_line_select = self.line_select_range.map_or(false, |(s, e)| {
+                    let in_line_select = self.line_select_range.is_some_and(|(s, e)| {
                         line_num >= s && line_num <= e
                     });
                     let comment_range_info = self
@@ -835,11 +834,9 @@ impl FileViewer {
                         .iter()
                         .find(|(c, _)| line_num >= c.start_line && line_num <= c.end_line);
                     let in_comment_range = comment_range_info.is_some();
-                    let in_stale_comment = comment_range_info.map_or(false, |(_, s)| *s);
+                    let in_stale_comment = comment_range_info.is_some_and(|(_, s)| *s);
 
-                    let highlight_bg = if focused && code_line_idx == self.cursor_line && self.cursor_on_comment.is_none() {
-                        Some(Color::DarkGray)
-                    } else if in_line_select {
+                    let highlight_bg = if (focused && code_line_idx == self.cursor_line && self.cursor_on_comment.is_none()) || in_line_select {
                         Some(Color::DarkGray)
                     } else if in_stale_comment {
                         Some(Color::Indexed(52)) // dark red bg for stale comments
@@ -866,7 +863,7 @@ impl FileViewer {
                     let editing_this_line = self
                         .comment_edit
                         .as_ref()
-                        .map_or(false, |e| e.target_line == line_num);
+                        .is_some_and(|e| e.target_line == line_num);
 
                     if editing_this_line {
                         // Inline editor takes priority over saved comment
@@ -879,11 +876,11 @@ impl FileViewer {
                                 self.row_map.push(VisualRowContent::CommentRow(edit.start_line, edit.target_line));
                             }
                         }
-                    } else if let Some((comment, is_stale)) = self.comment_at_end_line(line_num) {
-                        if render_row < max_rows {
+                    } else if let Some((comment, is_stale)) = self.comment_at_end_line(line_num)
+                        && render_row < max_rows {
                             // Check if cursor is on this comment row
                             let cursor_on_this = focused && self.cursor_on_comment
-                                .map_or(false, |(s, e)| s == comment.start_line && e == comment.end_line);
+                                .is_some_and(|(s, e)| s == comment.start_line && e == comment.end_line);
                             let comment_render_start = render_row;
                             let c_start = comment.start_line;
                             let c_end = comment.end_line;
@@ -904,7 +901,6 @@ impl FileViewer {
                                 }
                             }
                         }
-                    }
                 }
 
                 // Render minimap after content
@@ -1035,7 +1031,7 @@ impl FileViewer {
             let start = self.scroll_offset * virtual_h / total;
             let visible = self.visible_height.min(total);
             let end_numer = (self.scroll_offset + visible) * virtual_h;
-            let end = ((end_numer + total - 1) / total).min(virtual_h);
+            let end = end_numer.div_ceil(total).min(virtual_h);
             (start, end.max(start + 1))
         } else {
             (0, virtual_h)
@@ -1242,7 +1238,7 @@ impl FileViewer {
                 let editing_this_line = self
                     .comment_edit
                     .as_ref()
-                    .map_or(false, |e| e.target_line == ln);
+                    .is_some_and(|e| e.target_line == ln);
 
                 if editing_this_line {
                     if let Some(ref edit) = self.comment_edit {
@@ -1254,10 +1250,10 @@ impl FileViewer {
                             self.row_map.push(VisualRowContent::CommentRow(edit.start_line, edit.target_line));
                         }
                     }
-                } else if let Some((comment, is_stale)) = self.comment_at_end_line(ln) {
-                    if render_row < max_rows {
+                } else if let Some((comment, is_stale)) = self.comment_at_end_line(ln)
+                    && render_row < max_rows {
                         let cursor_on_this = self.cursor_on_comment
-                            .map_or(false, |(s, e)| s == comment.start_line && e == comment.end_line);
+                            .is_some_and(|(s, e)| s == comment.start_line && e == comment.end_line);
                         let comment_render_start = render_row;
                         let c_start = comment.start_line;
                         let c_end = comment.end_line;
@@ -1277,7 +1273,6 @@ impl FileViewer {
                             }
                         }
                     }
-                }
             }
         }
     }
