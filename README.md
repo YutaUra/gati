@@ -27,8 +27,10 @@ brew install YutaUra/tap/gati
 ### Nix
 
 ```sh
-nix profile install github:YutaUra/gati
+nix profile install github:YutaUra/gati --accept-flake-config
 ```
+
+The `--accept-flake-config` flag enables the binary cache so you get a pre-built binary instead of compiling from source. Without it, Nix will prompt you to approve the cache.
 
 Or with flakes in your configuration:
 
