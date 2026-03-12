@@ -28,7 +28,7 @@
       {
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "gati";
-          version = "0.4.0";
+          version = "0.4.2";
           src = self;
 
           cargoLock.lockFile = ./Cargo.lock;
