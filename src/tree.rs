@@ -46,7 +46,7 @@ impl TreeEntry {
 }
 
 /// Scan a directory and return its immediate children as TreeEntries.
-/// Respects .gitignore and hides dotfiles. Always hides `.git`.
+/// Respects .gitignore. Shows dotfiles but always hides `.git`.
 pub fn scan_dir(dir: &Path, depth: usize) -> anyhow::Result<Vec<TreeEntry>> {
     use ignore::WalkBuilder;
 
@@ -54,7 +54,8 @@ pub fn scan_dir(dir: &Path, depth: usize) -> anyhow::Result<Vec<TreeEntry>> {
 
     let walker = WalkBuilder::new(dir)
         .max_depth(Some(1))
-        .hidden(true) // skip dotfiles
+        .hidden(false)
+        .filter_entry(|e| e.file_name() != ".git")
         .build();
 
     for result in walker {
@@ -295,7 +296,10 @@ pub fn search_files(root: &Path, query: &str) -> anyhow::Result<Vec<TreeEntry>> 
     let query_lower = query.to_lowercase();
 
     // First pass: walk to find matching file paths and their ancestors
-    let walker = WalkBuilder::new(root).hidden(true).build();
+    let walker = WalkBuilder::new(root)
+        .hidden(false)
+        .filter_entry(|e| e.file_name() != ".git")
+        .build();
     let mut matching_set: HashSet<PathBuf> = HashSet::new();
 
     for result in walker {
@@ -327,7 +331,8 @@ pub fn search_files(root: &Path, query: &str) -> anyhow::Result<Vec<TreeEntry>> 
 
     // Second pass: walk in sorted order, keeping only matching entries
     let walker = WalkBuilder::new(root)
-        .hidden(true)
+        .hidden(false)
+        .filter_entry(|e| e.file_name() != ".git")
         .sort_by_file_name(|a: &OsStr, b: &OsStr| {
             let a_lower = a.to_ascii_lowercase();
             let b_lower = b.to_ascii_lowercase();
@@ -468,13 +473,14 @@ mod tests {
     }
 
     #[test]
-    fn scan_dir_hides_dotfiles() {
-        let tmp = setup_dir(&[".hidden", "visible.txt"], &[".secret"]);
+    fn scan_dir_shows_dotfiles_but_hides_git() {
+        let tmp = setup_dir(&[".hidden", "visible.txt"], &[".git", ".github"]);
         let entries = scan_dir(tmp.path(), 0).unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name()).collect();
-        assert!(!names.contains(&".hidden"));
-        assert!(!names.contains(&".secret"));
+        assert!(names.contains(&".hidden"));
+        assert!(names.contains(&".github"));
         assert!(names.contains(&"visible.txt"));
+        assert!(!names.contains(&".git"));
     }
 
     #[test]
