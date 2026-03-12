@@ -16,10 +16,10 @@ rustPlatform.buildRustPackage {
     owner = "YutaUra";
     repo = "gati";
     rev = "v${version}";
-    hash = "";
+    hash = "sha256-8mZ4D+gHBn7fo0PzRNLpfHUjVEhYQibNMPXYp+uIb/M=";
   };
 
-  cargoHash = "";
+  cargoHash = "sha256-XFIbveWGN38n3lna4ZrMB0z8qtnNLgeJixCYaZcYV68=";
 
   nativeBuildInputs = [ pkg-config cmake ];
 
