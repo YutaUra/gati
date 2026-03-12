@@ -716,198 +716,208 @@ impl FileViewer {
             return;
         }
 
-        match &self.content {
-            ViewerContent::Placeholder => {
-                self.minimap_rect = None;
-                let msg = "Select a file to preview";
-                let line = Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray)));
-                buf.set_line(inner.x, inner.y, &line, inner.width);
-            }
-            ViewerContent::Binary(_) => {
-                self.minimap_rect = None;
-                let msg = "Binary file — cannot display";
-                let line = Line::from(Span::styled(msg, Style::default().fg(Color::Yellow)));
-                buf.set_line(inner.x, inner.y, &line, inner.width);
-            }
-            ViewerContent::Empty(_) => {
-                self.minimap_rect = None;
-                let msg = "Empty file";
-                let line = Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray)));
-                buf.set_line(inner.x, inner.y, &line, inner.width);
-            }
-            ViewerContent::Error(msg) => {
-                self.minimap_rect = None;
-                let line = Line::from(Span::styled(msg.as_str(), Style::default().fg(Color::Red)));
-                buf.set_line(inner.x, inner.y, &line, inner.width);
-            }
+        match self.content {
             ViewerContent::File { .. } => {
-                // Extract line count to call ensure_highlighted_up_to outside the borrow.
-                let line_count = match &self.content {
-                    ViewerContent::File { lines, .. } => lines.len(),
-                    _ => 0,
-                };
+                self.render_file_content(content_area, minimap_area, buf, focused);
+            }
+            _ => {
+                self.render_placeholder(inner, buf);
+            }
+        }
+    }
 
-                // Auto-scroll to keep inline comment editor visible.
-                // The editor renders below the target line, so we need
-                // target_line (0-indexed) + 2 extra rows to be in viewport.
-                if let Some(ref edit) = self.comment_edit {
-                    let target_idx = edit.target_line.saturating_sub(1); // 0-indexed
-                    let editor_rows = 2; // editor + separator
-                    let need_visible = target_idx + 1 + editor_rows;
-                    let vh = content_area.height as usize;
-                    if need_visible > self.scroll_offset + vh {
-                        self.scroll_offset = need_visible.saturating_sub(vh);
+    /// Render a single-line status message for non-file content states.
+    fn render_placeholder(&mut self, area: Rect, buf: &mut Buffer) {
+        self.minimap_rect = None;
+        let render_msg = |msg: &str, color: Color, buf: &mut Buffer| {
+            let line = Line::from(Span::styled(msg, Style::default().fg(color)));
+            buf.set_line(area.x, area.y, &line, area.width);
+        };
+        match &self.content {
+            ViewerContent::Placeholder => render_msg("Select a file to preview", Color::DarkGray, buf),
+            ViewerContent::Binary(_) => render_msg("Binary file — cannot display", Color::Yellow, buf),
+            ViewerContent::Empty(_) => render_msg("Empty file", Color::DarkGray, buf),
+            ViewerContent::Error(msg) => render_msg(msg, Color::Red, buf),
+            ViewerContent::File { .. } => {}
+        }
+    }
+
+    /// Build gutter spans (diff marker + line number) for a single line.
+    fn gutter_spans(&self, line_num: usize, gutter_width: usize, has_diff: bool) -> Vec<Span<'static>> {
+        let mut spans = Vec::new();
+        if has_diff {
+            let kind = self
+                .line_diff
+                .as_ref()
+                .map(|d| d.line_kind(line_num))
+                .unwrap_or(DiffLineKind::Unchanged);
+            let (marker, color) = match kind {
+                DiffLineKind::Modified => ("▎", Some(Color::Yellow)),
+                DiffLineKind::Added => ("▎", Some(Color::Green)),
+                DiffLineKind::Unchanged => (" ", None),
+            };
+            let style = color
+                .map(|c| Style::default().fg(c))
+                .unwrap_or_default();
+            spans.push(Span::styled(marker, style));
+        }
+        let num_str = format!("{:>width$} ", line_num, width = gutter_width);
+        spans.push(Span::styled(num_str, Style::default().fg(Color::DarkGray)));
+        spans
+    }
+
+    /// Render file content with gutter, syntax highlighting, and inline comments.
+    fn render_file_content(
+        &mut self,
+        content_area: Rect,
+        minimap_area: Option<Rect>,
+        buf: &mut Buffer,
+        focused: bool,
+    ) {
+        // Extract line count to call ensure_highlighted_up_to outside the borrow.
+        let line_count = match &self.content {
+            ViewerContent::File { lines, .. } => lines.len(),
+            _ => 0,
+        };
+
+        // Auto-scroll to keep inline comment editor visible.
+        // The editor renders below the target line, so we need
+        // target_line (0-indexed) + 2 extra rows to be in viewport.
+        if let Some(ref edit) = self.comment_edit {
+            let target_idx = edit.target_line.saturating_sub(1); // 0-indexed
+            let editor_rows = 2; // editor + separator
+            let need_visible = target_idx + 1 + editor_rows;
+            let vh = content_area.height as usize;
+            if need_visible > self.scroll_offset + vh {
+                self.scroll_offset = need_visible.saturating_sub(vh);
+            }
+        }
+
+        // Incrementally compute highlights up to the last visible line.
+        let need_up_to = (self.scroll_offset + content_area.height as usize).min(line_count);
+        self.ensure_highlighted_up_to(need_up_to);
+
+        let lines = match &self.content {
+            ViewerContent::File { lines, .. } => lines,
+            _ => unreachable!(),
+        };
+        let gutter_width = line_number_width(lines.len());
+        let has_diff = self.line_diff.is_some();
+        // gutter = diff marker (1 if present) + line number digits + 1 space
+        let gutter_cols = gutter_width + 1 + if has_diff { 1 } else { 0 };
+        self.visible_content_width = (content_area.width as usize).saturating_sub(gutter_cols);
+
+        let mut render_row: u16 = 0;
+        let max_rows = content_area.height;
+        self.row_map.clear();
+
+        for (code_line_idx, code_line) in lines.iter().enumerate().skip(self.scroll_offset) {
+            if render_row >= max_rows {
+                break;
+            }
+
+            let line_num = code_line_idx + 1;
+
+            let mut spans = self.gutter_spans(line_num, gutter_width, has_diff);
+
+            // Use pre-computed highlight cache (O(1) per line instead of O(scroll_offset))
+            let highlighted = if code_line_idx < self.highlighted_lines.len() {
+                self.highlighted_lines[code_line_idx].clone()
+            } else {
+                vec![Span::raw(code_line.clone())]
+            };
+            if self.h_scroll > 0 {
+                spans.extend(skip_chars_in_spans(highlighted, self.h_scroll));
+            } else {
+                spans.extend(highlighted);
+            }
+
+            let line = Line::from(spans);
+
+            let y = content_area.y + render_row;
+            buf.set_line(content_area.x, y, &line, content_area.width);
+
+            // Determine background highlight for this line
+            let in_line_select = self.line_select_range.is_some_and(|(s, e)| {
+                line_num >= s && line_num <= e
+            });
+            let comment_range_info = self
+                .comments
+                .iter()
+                .find(|(c, _)| line_num >= c.start_line && line_num <= c.end_line);
+            let in_comment_range = comment_range_info.is_some();
+            let in_stale_comment = comment_range_info.is_some_and(|(_, s)| *s);
+
+            let highlight_bg = if (focused && code_line_idx == self.cursor_line && self.cursor_on_comment.is_none()) || in_line_select {
+                Some(Color::DarkGray)
+            } else if in_stale_comment {
+                Some(Color::Indexed(52)) // dark red bg for stale comments
+            } else if in_comment_range {
+                Some(Color::Indexed(236)) // subtle dark bg (#303030)
+            } else {
+                None
+            };
+            if let Some(bg) = highlight_bg {
+                for x in content_area.x..content_area.x + content_area.width {
+                    let cell = &mut buf[(x, y)];
+                    cell.set_bg(bg);
+                    // Keep line numbers readable on dark background
+                    if in_comment_range && cell.fg == Color::DarkGray {
+                        cell.set_fg(Color::Gray);
                     }
-                }
-
-                // Incrementally compute highlights up to the last visible line.
-                let need_up_to = (self.scroll_offset + content_area.height as usize).min(line_count);
-                self.ensure_highlighted_up_to(need_up_to);
-
-                let lines = match &self.content {
-                    ViewerContent::File { lines, .. } => lines,
-                    _ => unreachable!(),
-                };
-                let gutter_width = line_number_width(lines.len());
-                let has_diff = self.line_diff.is_some();
-                // gutter = diff marker (1 if present) + line number digits + 1 space
-                let gutter_cols = gutter_width + 1 + if has_diff { 1 } else { 0 };
-                self.visible_content_width = (content_area.width as usize).saturating_sub(gutter_cols);
-
-                let mut render_row: u16 = 0;
-                let max_rows = content_area.height;
-                self.row_map.clear();
-
-                for (code_line_idx, code_line) in lines.iter().enumerate().skip(self.scroll_offset) {
-                    if render_row >= max_rows {
-                        break;
-                    }
-
-                    let line_num = code_line_idx + 1;
-
-                    let mut spans = Vec::new();
-
-                    // Gutter change marker
-                    if has_diff {
-                        let kind = self
-                            .line_diff
-                            .as_ref()
-                            .map(|d| d.line_kind(line_num))
-                            .unwrap_or(DiffLineKind::Unchanged);
-                        let (marker, color) = match kind {
-                            DiffLineKind::Modified => ("▎", Some(Color::Yellow)),
-                            DiffLineKind::Added => ("▎", Some(Color::Green)),
-                            DiffLineKind::Unchanged => (" ", None),
-                        };
-                        let style = color
-                            .map(|c| Style::default().fg(c))
-                            .unwrap_or_default();
-                        spans.push(Span::styled(marker, style));
-                    }
-
-                    let num_str = format!("{:>width$} ", line_num, width = gutter_width);
-                    spans.push(Span::styled(num_str, Style::default().fg(Color::DarkGray)));
-
-                    // Use pre-computed highlight cache (O(1) per line instead of O(scroll_offset))
-                    let highlighted = if code_line_idx < self.highlighted_lines.len() {
-                        self.highlighted_lines[code_line_idx].clone()
-                    } else {
-                        vec![Span::raw(code_line.clone())]
-                    };
-                    if self.h_scroll > 0 {
-                        spans.extend(skip_chars_in_spans(highlighted, self.h_scroll));
-                    } else {
-                        spans.extend(highlighted);
-                    }
-
-                    let line = Line::from(spans);
-
-                    let y = content_area.y + render_row;
-                    buf.set_line(content_area.x, y, &line, content_area.width);
-
-                    // Determine background highlight for this line
-                    let in_line_select = self.line_select_range.is_some_and(|(s, e)| {
-                        line_num >= s && line_num <= e
-                    });
-                    let comment_range_info = self
-                        .comments
-                        .iter()
-                        .find(|(c, _)| line_num >= c.start_line && line_num <= c.end_line);
-                    let in_comment_range = comment_range_info.is_some();
-                    let in_stale_comment = comment_range_info.is_some_and(|(_, s)| *s);
-
-                    let highlight_bg = if (focused && code_line_idx == self.cursor_line && self.cursor_on_comment.is_none()) || in_line_select {
-                        Some(Color::DarkGray)
-                    } else if in_stale_comment {
-                        Some(Color::Indexed(52)) // dark red bg for stale comments
-                    } else if in_comment_range {
-                        Some(Color::Indexed(236)) // subtle dark bg (#303030)
-                    } else {
-                        None
-                    };
-                    if let Some(bg) = highlight_bg {
-                        for x in content_area.x..content_area.x + content_area.width {
-                            let cell = &mut buf[(x, y)];
-                            cell.set_bg(bg);
-                            // Keep line numbers readable on dark background
-                            if in_comment_range && cell.fg == Color::DarkGray {
-                                cell.set_fg(Color::Gray);
-                            }
-                        }
-                    }
-
-                    self.row_map.push(VisualRowContent::CodeLine(code_line_idx));
-                    render_row += 1;
-
-                    // Render inline comment editor or existing comment block
-                    let editing_this_line = self
-                        .comment_edit
-                        .as_ref()
-                        .is_some_and(|e| e.target_line == line_num);
-
-                    if editing_this_line {
-                        // Inline editor takes priority over saved comment
-                        if let Some(ref edit) = self.comment_edit {
-                            let before = render_row;
-                            self.render_comment_editor(
-                                edit, content_area, buf, &mut render_row, max_rows,
-                            );
-                            for _ in before..render_row {
-                                self.row_map.push(VisualRowContent::CommentRow(edit.start_line, edit.target_line));
-                            }
-                        }
-                    } else if let Some((comment, is_stale)) = self.comment_at_end_line(line_num)
-                        && render_row < max_rows {
-                            // Check if cursor is on this comment row
-                            let cursor_on_this = focused && self.cursor_on_comment
-                                .is_some_and(|(s, e)| s == comment.start_line && e == comment.end_line);
-                            let comment_render_start = render_row;
-                            let c_start = comment.start_line;
-                            let c_end = comment.end_line;
-                            self.render_comment_block(
-                                comment, is_stale, content_area, buf, &mut render_row, max_rows,
-                            );
-                            for _ in comment_render_start..render_row {
-                                self.row_map.push(VisualRowContent::CommentRow(c_start, c_end));
-                            }
-                            // Highlight all rows of the comment block when cursor is on it
-                            if cursor_on_this {
-                                for r in comment_render_start..render_row {
-                                    let y = content_area.y + r;
-                                    for x in content_area.x..content_area.x + content_area.width {
-                                        let cell = &mut buf[(x, y)];
-                                        cell.set_bg(Color::DarkGray);
-                                    }
-                                }
-                            }
-                        }
-                }
-
-                // Render minimap after content
-                if let Some(mr) = minimap_area {
-                    self.render_minimap(mr, buf);
                 }
             }
+
+            self.row_map.push(VisualRowContent::CodeLine(code_line_idx));
+            render_row += 1;
+
+            // Render inline comment editor or existing comment block
+            let editing_this_line = self
+                .comment_edit
+                .as_ref()
+                .is_some_and(|e| e.target_line == line_num);
+
+            if editing_this_line {
+                // Inline editor takes priority over saved comment
+                if let Some(ref edit) = self.comment_edit {
+                    let before = render_row;
+                    self.render_comment_editor(
+                        edit, content_area, buf, &mut render_row, max_rows,
+                    );
+                    for _ in before..render_row {
+                        self.row_map.push(VisualRowContent::CommentRow(edit.start_line, edit.target_line));
+                    }
+                }
+            } else if let Some((comment, is_stale)) = self.comment_at_end_line(line_num)
+                && render_row < max_rows {
+                    // Check if cursor is on this comment row
+                    let cursor_on_this = focused && self.cursor_on_comment
+                        .is_some_and(|(s, e)| s == comment.start_line && e == comment.end_line);
+                    let comment_render_start = render_row;
+                    let c_start = comment.start_line;
+                    let c_end = comment.end_line;
+                    self.render_comment_block(
+                        comment, is_stale, content_area, buf, &mut render_row, max_rows,
+                    );
+                    for _ in comment_render_start..render_row {
+                        self.row_map.push(VisualRowContent::CommentRow(c_start, c_end));
+                    }
+                    // Highlight all rows of the comment block when cursor is on it
+                    if cursor_on_this {
+                        for r in comment_render_start..render_row {
+                            let y = content_area.y + r;
+                            for x in content_area.x..content_area.x + content_area.width {
+                                let cell = &mut buf[(x, y)];
+                                cell.set_bg(Color::DarkGray);
+                            }
+                        }
+                    }
+                }
+        }
+
+        // Render minimap after content
+        if let Some(mr) = minimap_area {
+            self.render_minimap(mr, buf);
         }
     }
 
