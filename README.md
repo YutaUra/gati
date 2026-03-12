@@ -18,16 +18,33 @@ A terminal tool for reviewing code, not writing it.
 
 ## Installation
 
+### Homebrew
+
+```sh
+brew install YutaUra/tap/gati
+```
+
+### Nix
+
+```sh
+nix profile install github:YutaUra/gati
+```
+
+Or with flakes in your configuration:
+
+```nix
+{
+  inputs.gati.url = "github:YutaUra/gati";
+}
+```
+
 ### From source
 
 ```sh
 cargo install --path .
 ```
 
-### Requirements
-
-- Rust 1.85+ (edition 2024)
-- Git (libgit2 is vendored, no system install needed)
+Requires Rust 1.85+ (edition 2024).
 
 ## Quick Start
 
