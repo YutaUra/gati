@@ -157,6 +157,15 @@ pub fn compute_diffs(
         }
     }
 
+    // When there are no changes (no hunks), populate unified_lines with all
+    // working lines as Context so the diff view shows the file content
+    // instead of an empty "No changes" message.
+    if unified_lines.is_empty() {
+        for wl in &working_lines {
+            unified_lines.push(UnifiedDiffLine::Context(wl.to_string()));
+        }
+    }
+
     Some((
         LineDiff { lines: line_kinds },
         UnifiedDiff { lines: unified_lines },
@@ -300,11 +309,17 @@ mod tests {
     }
 
     #[test]
-    fn unified_diff_empty_for_clean_file() {
+    fn unified_diff_shows_all_context_for_clean_file() {
         let tmp = setup_git_repo(&[("file.txt", "line1\nline2\nline3")]);
         let root = canonical_tmp_path(&tmp);
         let diff = compute_unified_diff(&root, &root.join("file.txt")).unwrap();
-        assert!(diff.lines.is_empty());
+        // Even with no changes, all lines should appear as Context
+        // so the diff view shows the file content instead of "No changes".
+        assert_eq!(diff.lines.len(), 3);
+        assert!(diff
+            .lines
+            .iter()
+            .all(|l| matches!(l, UnifiedDiffLine::Context(_))));
     }
 
     #[test]
