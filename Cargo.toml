@@ -1,6 +1,6 @@
 [package]
 name = "gati"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 description = "A terminal tool for reviewing code, not writing it"
 license = "MIT"
