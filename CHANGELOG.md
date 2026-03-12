@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-03-12
+
+### Added
+
+- Mouse wheel scrolling for file tree and file viewer
+- Horizontal scrolling in file viewer (`H`/`L` keys, Shift+wheel)
+- Click-to-focus pane switching
+- Click-to-select, fold, and unfold in file tree
+- Double-tap `l` to recursively expand all subdirectories
+- Double-tap `h` to fold to root-level ancestor
+- Full-context unified diff with syntax highlighting and line numbers
+- Preview minimap with viewport position, diff markers, and comment indicators
+- Click-to-scroll navigation on minimap
+- Click-to-position cursor in file viewer
+- Mouse drag line selection (reuses V-mode LineSelect)
+- Help dialog overlay (`?` key) with grouped keybinding reference
+- Flash message feedback for comment export (success/empty/error)
+- Bug report and feedback pipeline: panic hook with pre-filled GitHub issue URL, `--bug-report` CLI flag, `B` key to open bug report in browser
+- README with project overview, features, keybindings, and demo GIFs
+- VHS tape files for demo GIF generation
+
+### Changed
+
+- Hint bar simplified to `? help  q quit` in Normal mode (full reference moved to help dialog)
+- Diff view shows file content as context lines instead of "No changes" for unchanged files
+- Preserve scroll position and cursor when toggling diff/preview
+- File selection optimized (~63ms → ~2ms) via single-pass diff computation and deferred syntax highlighting
+
+### Fixed
+
+- Stale git gutter indicators after filesystem changes
+- Click line mismatch when inline comments are present
+- File tree visible height calculation (was hardcoded to 20)
+
+### Dependencies
+
+- `open` for opening URLs in browser
+
 ## [0.3.0] - 2026-03-10
 
 ### Added
