@@ -77,27 +77,19 @@ const USER_TEMPLATE: &str = "\
 
 /// Build a pre-filled GitHub issue URL for a user-initiated bug report.
 pub fn build_url(title: &str, body: &str) -> String {
-    let env = gather_env();
-    let env_section = format_env_section(&env);
-
-    let full_body = if body.is_empty() {
-        format!("{}\n{}", USER_TEMPLATE, env_section)
+    let body_content = if body.is_empty() {
+        USER_TEMPLATE.to_string()
     } else {
-        format!("## Description\n\n{}\n\n{}", body, env_section)
+        format!("## Description\n\n{}", body)
     };
-
-    let base = format!("{}/issues/new?labels=bug", REPO_URL);
-    build_url_with_truncation(&base, title, &full_body)
+    build_issue_url(title, &body_content, &["bug"])
 }
 
 /// Build a pre-filled GitHub issue URL specifically for panic reports.
 /// Uses a crash-specific template instead of the user template.
 /// `crash_log` is the full panic output (message + backtrace if available).
 pub fn build_panic_url(crash_log: &str) -> String {
-    let env = gather_env();
-    let env_section = format_env_section(&env);
-
-    let full_body = format!(
+    let body_content = format!(
         "## Crash Report\n\n\
          gati crashed unexpectedly. The information below has been \
          automatically collected to help diagnose the issue.\n\n\
@@ -109,16 +101,25 @@ pub fn build_panic_url(crash_log: &str) -> String {
          2. \n\
          3. \n\n\
          ## Additional context\n\n\
-         <!-- Any other details that might help -->\n\n\
-         {}",
-        crash_log, env_section
+         <!-- Any other details that might help -->",
+        crash_log
     );
 
     // Extract a short title from the first line of the crash log
     let first_line = crash_log.lines().next().unwrap_or("unknown panic");
     let title = format!("crash: {}", &first_line[..first_line.len().min(60)]);
-    let base = format!("{}/issues/new?labels=bug%2Ccrash", REPO_URL);
-    build_url_with_truncation(&base, &title, &full_body)
+    build_issue_url(&title, &body_content, &["bug", "crash"])
+}
+
+/// Shared URL builder: appends environment info to body, encodes labels,
+/// and truncates to fit within GitHub's URL length limit.
+fn build_issue_url(title: &str, body_before_env: &str, labels: &[&str]) -> String {
+    let env = gather_env();
+    let env_section = format_env_section(&env);
+    let full_body = format!("{}\n\n{}", body_before_env, env_section);
+    let label_str = labels.join("%2C");
+    let base = format!("{}/issues/new?labels={}", REPO_URL, label_str);
+    build_url_with_truncation(&base, title, &full_body)
 }
 
 fn build_url_with_truncation(base: &str, title: &str, body: &str) -> String {
