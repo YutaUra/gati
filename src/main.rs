@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "gati", about = "A terminal tool for reviewing code, not writing it")]
+#[command(name = "gati", about = "A terminal tool for reviewing code, not writing it", version)]
 struct Cli {
     /// Path to open (directory or file). Defaults to current directory.
     #[arg(default_value = ".")]
