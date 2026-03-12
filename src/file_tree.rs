@@ -248,6 +248,8 @@ impl FileTree {
 
             let style = if is_selected {
                 Style::default().fg(Color::Black).bg(Color::White)
+            } else if entry.is_gitignored {
+                Style::default().fg(Color::DarkGray)
             } else {
                 Style::default()
             };
@@ -275,6 +277,8 @@ impl FileTree {
             if let Some((marker, color)) = marker_info {
                 let marker_style = if is_selected {
                     Style::default().fg(color).bg(Color::White)
+                } else if entry.is_gitignored {
+                    Style::default().fg(Color::DarkGray)
                 } else {
                     Style::default().fg(color)
                 };
@@ -290,6 +294,8 @@ impl FileTree {
             if has_comments {
                 let comment_style = if is_selected {
                     Style::default().fg(Color::Cyan).bg(Color::White)
+                } else if entry.is_gitignored {
+                    Style::default().fg(Color::DarkGray)
                 } else {
                     Style::default().fg(Color::Cyan)
                 };

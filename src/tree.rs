@@ -13,6 +13,8 @@ pub struct TreeEntry {
     pub is_expanded: bool,
     /// Git status for this file (None if clean or not in a git repo).
     pub git_status: Option<FileStatus>,
+    /// Whether this entry is ignored by .gitignore.
+    pub is_gitignored: bool,
 }
 
 impl TreeEntry {
@@ -23,6 +25,7 @@ impl TreeEntry {
             is_directory: false,
             is_expanded: false,
             git_status: None,
+            is_gitignored: false,
         }
     }
 
@@ -33,6 +36,7 @@ impl TreeEntry {
             is_directory: true,
             is_expanded: false,
             git_status: None,
+            is_gitignored: false,
         }
     }
 
@@ -46,33 +50,53 @@ impl TreeEntry {
 }
 
 /// Scan a directory and return its immediate children as TreeEntries.
-/// Respects .gitignore. Shows dotfiles but always hides `.git`.
+/// Shows dotfiles but always hides `.git`.
+/// Files/directories ignored by .gitignore are included with `is_gitignored = true`.
 pub fn scan_dir(dir: &Path, depth: usize) -> anyhow::Result<Vec<TreeEntry>> {
     use ignore::WalkBuilder;
 
-    let mut entries = Vec::new();
-
+    // Pass 1: Walk with gitignore rules to collect non-ignored paths.
     let walker = WalkBuilder::new(dir)
         .max_depth(Some(1))
         .hidden(false)
         .filter_entry(|e| e.file_name() != ".git")
         .build();
 
+    let mut non_ignored: HashSet<PathBuf> = HashSet::new();
     for result in walker {
         let entry = result?;
         let path = entry.path().to_path_buf();
+        if path != dir {
+            non_ignored.insert(path);
+        }
+    }
 
-        // Skip the root directory itself
-        if path == dir {
+    // Pass 2: Read all entries from disk (excluding .git) and mark ignored ones.
+    let mut entries = Vec::new();
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(entries),
+    };
+
+    for result in read_dir {
+        let dir_entry = result?;
+        let path = dir_entry.path();
+
+        // Always hide .git
+        if dir_entry.file_name() == ".git" {
             continue;
         }
 
-        let is_dir = entry.file_type().map_or(false, |ft| ft.is_dir());
-        if is_dir {
-            entries.push(TreeEntry::directory(path, depth));
+        let is_dir = dir_entry.file_type().is_ok_and(|ft| ft.is_dir());
+        let is_gitignored = !non_ignored.contains(&path);
+
+        let mut tree_entry = if is_dir {
+            TreeEntry::directory(path, depth)
         } else {
-            entries.push(TreeEntry::file(path, depth));
-        }
+            TreeEntry::file(path, depth)
+        };
+        tree_entry.is_gitignored = is_gitignored;
+        entries.push(tree_entry);
     }
 
     Ok(entries)
@@ -532,14 +556,34 @@ mod tests {
     }
 
     #[test]
-    fn scan_dir_hides_gitignored_files() {
+    fn scan_dir_includes_gitignored_files_with_flag() {
         // ignore crate requires .git directory to recognize .gitignore
         let tmp = setup_dir(&["keep.rs", "build.log"], &[".git"]);
         fs::write(tmp.path().join(".gitignore"), "*.log\n").unwrap();
         let entries = scan_dir(tmp.path(), 0).unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name()).collect();
         assert!(names.contains(&"keep.rs"));
-        assert!(!names.contains(&"build.log"));
+        assert!(names.contains(&"build.log"), "Gitignored file should be included");
+
+        let ignored = entries.iter().find(|e| e.name() == "build.log").unwrap();
+        assert!(ignored.is_gitignored, "Gitignored file should have is_gitignored = true");
+
+        let kept = entries.iter().find(|e| e.name() == "keep.rs").unwrap();
+        assert!(!kept.is_gitignored, "Non-ignored file should have is_gitignored = false");
+    }
+
+    #[test]
+    fn scan_dir_includes_gitignored_directory_with_flag() {
+        let tmp = setup_dir(&["dist/bundle.js"], &[".git", "dist", "src"]);
+        fs::write(tmp.path().join(".gitignore"), "dist/\n").unwrap();
+        let entries = scan_dir(tmp.path(), 0).unwrap();
+
+        let dist = entries.iter().find(|e| e.name() == "dist").unwrap();
+        assert!(dist.is_gitignored, "Gitignored directory should have is_gitignored = true");
+        assert!(dist.is_directory);
+
+        let src = entries.iter().find(|e| e.name() == "src").unwrap();
+        assert!(!src.is_gitignored, "Non-ignored directory should have is_gitignored = false");
     }
 
     #[test]
