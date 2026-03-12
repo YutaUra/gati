@@ -1,6 +1,11 @@
 {
   description = "gati - a terminal tool for reviewing code, not writing it";
 
+  nixConfig = {
+    extra-substituters = ["https://yutaura.cachix.org"];
+    extra-trusted-public-keys = ["yutaura.cachix.org-1:uoMGhQXiri/CBTK1IByqBipk42mkEfWhYo2q9ENseJ8="];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
