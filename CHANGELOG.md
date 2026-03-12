@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-03-12
+
+### Added
+
+- Syntax highlighting for 100+ additional languages (TypeScript, TSX, TOML, Nix, and more) via two-face
+- Background git status computation for faster startup on large repositories
+
+### Fixed
+
+- Global keybindings (`b`, `?`) no longer intercept typed characters during file tree search
+
 ## [0.5.0] - 2026-03-12
 
 ### Added
