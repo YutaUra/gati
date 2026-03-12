@@ -326,8 +326,11 @@ pub fn run(target: &super::StartupTarget) -> anyhow::Result<()> {
     install_panic_hook();
     let mut terminal = init_terminal()?;
 
-    // Check minimum terminal size
-    let size = terminal.size()?;
+    // Wait for a valid terminal size.
+    // In multi-layer PTY setups (e.g. zellij → kubectl exec → container),
+    // the remote PTY may initially report 0x0 because the resize message
+    // has not arrived yet. Poll briefly before giving up.
+    let size = wait_for_terminal_size(&terminal)?;
     if size.width < MIN_WIDTH || size.height < MIN_HEIGHT {
         restore_terminal()?;
         anyhow::bail!(
@@ -390,6 +393,34 @@ fn init_terminal() -> anyhow::Result<DefaultTerminal> {
     io::stdout().execute(EnableMouseCapture)?;
     let terminal = ratatui::init();
     Ok(terminal)
+}
+
+/// Poll `terminal.size()` until it returns a non-zero value, or give up
+/// after a short deadline.  This handles the case where a resize message
+/// from an outer multiplexer (e.g. zellij) or kubectl has not yet reached
+/// the PTY when gati starts.
+fn wait_for_terminal_size(
+    terminal: &DefaultTerminal,
+) -> anyhow::Result<ratatui::layout::Size> {
+    use std::thread;
+
+    let size = terminal.size()?;
+    if size.width > 0 && size.height > 0 {
+        return Ok(size);
+    }
+
+    // Retry up to 2 seconds in 50 ms intervals.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+        let size = terminal.size()?;
+        if size.width > 0 && size.height > 0 {
+            return Ok(size);
+        }
+    }
+
+    // Return whatever we got; the caller decides whether to bail.
+    Ok(terminal.size()?)
 }
 
 fn restore_terminal() -> anyhow::Result<()> {
@@ -483,6 +514,8 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<(
                         return Ok(());
                     }
                 }
+                // Terminal resize: just let the next draw() pick up the new size.
+                Event::Resize(_width, _height) => {}
                 _ => {}
             }
         }
