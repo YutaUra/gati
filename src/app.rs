@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::{
-    event::{self, Event, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -427,12 +427,17 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<(
                         continue;
                     }
 
+                    // Ctrl+C always quits, regardless of mode
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        return Ok(());
+                    }
+
                     // Handle help dialog: consume all keys, close on ? / Esc / q
                     if app.show_help {
                         match key.code {
-                            crossterm::event::KeyCode::Char('?')
-                            | crossterm::event::KeyCode::Esc
-                            | crossterm::event::KeyCode::Char('q') => {
+                            KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
                                 app.show_help = false;
                             }
                             _ => {}
@@ -456,13 +461,13 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<(
                     }
 
                     // '?' toggles help dialog in Normal mode
-                    if key.code == crossterm::event::KeyCode::Char('?') {
+                    if key.code == KeyCode::Char('?') {
                         app.show_help = !app.show_help;
                         continue;
                     }
 
                     // 'b' toggles focus mode in Normal mode (both panes)
-                    if key.code == crossterm::event::KeyCode::Char('b')
+                    if key.code == KeyCode::Char('b')
                         && key.modifiers.is_empty()
                     {
                         toggle_focus_mode(app);
