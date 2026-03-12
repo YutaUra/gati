@@ -26,6 +26,7 @@ impl FileStatus {
 }
 
 /// Git status data for a repository.
+#[derive(Clone)]
 pub struct GitStatus {
     /// Per-file status, keyed by absolute path.
     file_statuses: HashMap<PathBuf, FileStatus>,

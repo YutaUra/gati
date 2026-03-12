@@ -188,8 +188,59 @@ impl FileTreeModel {
             .is_some_and(|gs| gs.dir_has_changes(path))
     }
 
+    /// Update git status annotations without rescanning the filesystem.
+    /// Re-annotates all entries, injects deleted files, and reapplies the filter.
+    pub fn update_git_status(&mut self, git_status: Option<GitStatus>) {
+        self.git_status = git_status;
+
+        // Remember expanded dirs and selection for restoration
+        let expanded: HashSet<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|e| e.is_directory && e.is_expanded)
+            .map(|e| e.path.clone())
+            .collect();
+        let selected_path = self.entries.get(self.selected).map(|e| e.path.clone());
+
+        // Remove previously injected deleted-file entries (they may have changed)
+        self.entries
+            .retain(|e| e.git_status != Some(FileStatus::Deleted) || e.path.exists());
+
+        // Clear all file annotations first
+        for entry in &mut self.entries {
+            if !entry.is_directory {
+                entry.git_status = None;
+            }
+        }
+
+        if let Some(ref gs) = self.git_status {
+            // Re-inject deleted files at root level
+            inject_deleted_files(&mut self.entries, gs, &self.root, 0);
+
+            // Re-inject deleted files into expanded directories
+            for dir_path in &expanded {
+                if let Some(dir_entry) = self.entries.iter().find(|e| &e.path == dir_path) {
+                    let child_depth = dir_entry.depth + 1;
+                    inject_deleted_files(&mut self.entries, gs, dir_path, child_depth);
+                }
+            }
+
+            // Re-annotate all entries
+            annotate_entries(&mut self.entries, gs);
+
+            if self.filter_changed {
+                filter_changed_entries(&mut self.entries, gs);
+            }
+        }
+
+        // Restore selection
+        self.selected = selected_path
+            .and_then(|p| self.entries.iter().position(|e| e.path == p))
+            .unwrap_or(self.selected.min(self.entries.len().saturating_sub(1)));
+    }
+
     /// Rescan the file tree from disk, preserving expanded directories and selection.
-    /// Also refreshes git status.
+    /// Does NOT refresh git status — call `update_git_status()` separately if needed.
     pub fn refresh_tree(&mut self) -> anyhow::Result<()> {
         // Remember which directories are expanded
         let expanded: std::collections::HashSet<PathBuf> = self
@@ -202,10 +253,7 @@ impl FileTreeModel {
         // Remember current selection path
         let selected_path = self.entries.get(self.selected).map(|e| e.path.clone());
 
-        // Refresh git status
-        self.git_status = GitStatus::from_dir(&self.root);
-
-        // Rescan root
+        // Rescan root (git status is NOT refreshed here; use update_git_status() separately)
         let mut entries = scan_dir(&self.root, 0)?;
         if let Some(ref gs) = self.git_status {
             inject_deleted_files(&mut entries, gs, &self.root, 0);
@@ -626,10 +674,34 @@ mod tests {
     }
 
     #[test]
-    fn refresh_git_status_updates_file_annotations() {
+    fn update_git_status_annotates_modified_file() {
         let (_tmp, root) = setup_git_repo(&[("file.txt", "hello")]);
 
-        // Initially clean: no git status on file entry
+        // Start with no git status
+        let mut model = FileTreeModel::from_dir(&root, None).unwrap();
+        let file_entry = model.entries.iter().find(|e| e.name() == "file.txt").unwrap();
+        assert_eq!(file_entry.git_status, None, "Initially no git status");
+
+        // Modify file externally
+        fs::write(root.join("file.txt"), "modified").unwrap();
+
+        // Update git status separately (simulates background worker completing)
+        let gs = GitStatus::from_dir(&root);
+        model.update_git_status(gs);
+
+        // Now file should show Modified
+        let file_entry = model.entries.iter().find(|e| e.name() == "file.txt").unwrap();
+        assert_eq!(
+            file_entry.git_status,
+            Some(FileStatus::Modified),
+            "After update_git_status, modified file should have Modified status"
+        );
+    }
+
+    #[test]
+    fn refresh_tree_then_update_git_status() {
+        let (_tmp, root) = setup_git_repo(&[("file.txt", "hello")]);
+
         let gs = GitStatus::from_dir(&root);
         let mut model = FileTreeModel::from_dir(&root, gs).unwrap();
         let file_entry = model.entries.iter().find(|e| e.name() == "file.txt").unwrap();
@@ -638,15 +710,19 @@ mod tests {
         // Modify file externally
         fs::write(root.join("file.txt"), "modified").unwrap();
 
-        // Refresh tree (includes git status)
+        // refresh_tree rescans FS layout but does not update git status
         model.refresh_tree().unwrap();
+        let file_entry = model.entries.iter().find(|e| e.name() == "file.txt").unwrap();
+        assert_eq!(file_entry.git_status, None, "refresh_tree alone does not update git status");
 
-        // Now file should show Modified
+        // update_git_status fills in the annotations
+        let gs = GitStatus::from_dir(&root);
+        model.update_git_status(gs);
         let file_entry = model.entries.iter().find(|e| e.name() == "file.txt").unwrap();
         assert_eq!(
             file_entry.git_status,
             Some(FileStatus::Modified),
-            "After refresh, modified file should have Modified status"
+            "update_git_status should annotate the modified file"
         );
     }
 

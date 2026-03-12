@@ -1,5 +1,6 @@
 use std::io;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -79,6 +80,29 @@ pub enum InputMode {
     },
 }
 
+/// Computes git status on a background thread and sends the result via a channel.
+struct GitStatusWorker {
+    receiver: mpsc::Receiver<Option<GitStatus>>,
+}
+
+impl GitStatusWorker {
+    /// Spawn a background thread to compute git status for `dir`.
+    fn spawn(dir: PathBuf) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let status = GitStatus::from_dir(&dir);
+            // Ignore send error — the receiver may have been dropped if the app quit.
+            let _ = sender.send(status);
+        });
+        Self { receiver }
+    }
+
+    /// Non-blocking check for a completed git status result.
+    fn try_recv(&self) -> Option<Option<GitStatus>> {
+        self.receiver.try_recv().ok()
+    }
+}
+
 pub struct App {
     file_tree: FileTree,
     file_viewer: FileViewer,
@@ -87,6 +111,8 @@ pub struct App {
     git_workdir: Option<PathBuf>,
     /// Root directory being browsed (for periodic git status refresh).
     target_dir: PathBuf,
+    /// Background worker for computing git status.
+    git_worker: Option<GitStatusWorker>,
     /// In-memory comment store for the session.
     pub comment_store: CommentStore,
     /// Current input mode.
@@ -112,14 +138,16 @@ pub struct App {
 
 impl App {
     pub fn new(target: &super::StartupTarget) -> anyhow::Result<Self> {
-        let git_status = GitStatus::from_dir(&target.dir);
-
         // Cache git workdir for diff computation
         let git_workdir = git2::Repository::discover(&target.dir)
             .ok()
             .and_then(|r| r.workdir().and_then(|w| w.canonicalize().ok()));
 
-        let mut file_tree = FileTree::new(&target.dir, git_status)?;
+        // Build tree immediately without git status — it will be filled in asynchronously.
+        let mut file_tree = FileTree::new(&target.dir, None)?;
+
+        // Spawn background thread to compute git status
+        let git_worker = Some(GitStatusWorker::spawn(target.dir.clone()));
         let mut file_viewer = FileViewer::new();
 
         // If a file was specified, select it and load it
@@ -159,6 +187,7 @@ impl App {
             focus: Focus::Tree,
             git_workdir,
             target_dir: target.dir.clone(),
+            git_worker,
             comment_store: CommentStore::new(),
             input_mode: InputMode::Normal,
             tree_width_percent: 30,
@@ -299,9 +328,15 @@ impl App {
     }
 
     /// Refresh state when the filesystem watcher detects changes.
-    /// Re-reads the file content, file tree, and recomputes diff for the currently viewed file.
+    /// Re-reads the file tree layout (fast, sync) and spawns a background thread
+    /// for git status recomputation.
     fn refresh_on_fs_change(&mut self) {
+        // Rescan filesystem layout (fast — no git status)
         let _ = self.file_tree.model.refresh_tree();
+
+        // Spawn background git status recomputation
+        self.git_worker = Some(GitStatusWorker::spawn(self.target_dir.clone()));
+
         // Reload file content from disk (preserves cursor/scroll position)
         self.file_viewer.reload_content();
         if let Some(path) = self.file_viewer.current_file().map(|p| p.to_path_buf()) {
@@ -517,6 +552,14 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<(
                 // Terminal resize: just let the next draw() pick up the new size.
                 Event::Resize(_width, _height) => {}
                 _ => {}
+            }
+        }
+
+        // Check if background git status computation has completed
+        if let Some(ref worker) = app.git_worker {
+            if let Some(git_status) = worker.try_recv() {
+                app.file_tree.model.update_git_status(git_status);
+                app.git_worker = None;
             }
         }
 
