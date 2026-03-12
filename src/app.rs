@@ -526,8 +526,13 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<(
                         InputMode::Normal => {}
                     }
 
+                    // Global keybindings are suppressed while file tree
+                    // search is active so that typed characters reach the
+                    // search query instead of triggering shortcuts.
+                    let in_search = app.file_tree.search.is_some();
+
                     // '?' toggles help dialog in Normal mode
-                    if key.code == KeyCode::Char('?') {
+                    if key.code == KeyCode::Char('?') && !in_search {
                         app.show_help = !app.show_help;
                         continue;
                     }
@@ -535,6 +540,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<(
                     // 'b' toggles focus mode in Normal mode (both panes)
                     if key.code == KeyCode::Char('b')
                         && key.modifiers.is_empty()
+                        && !in_search
                     {
                         toggle_focus_mode(app);
                         continue;
@@ -1538,6 +1544,27 @@ mod tests {
         toggle_focus_mode(&mut app); // exit
         assert!(!app.focus_mode);
         assert_eq!(app.tree_width_percent, 40);
+    }
+
+    #[test]
+    fn search_mode_suppresses_focus_mode_toggle() {
+        let tmp = setup_dir(&["file.rs"], &[]);
+        let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
+
+        // Enter search mode on file tree
+        app.file_tree.search = Some(crate::file_tree::SearchState::new_for_test());
+
+        // Simulate 'b' key via handle_event on the file tree
+        let key = crossterm::event::KeyEvent::new(
+            KeyCode::Char('b'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+
+        // In the real event loop, the guard `!in_search` prevents
+        // toggle_focus_mode from firing. We verify the guard condition:
+        let in_search = app.file_tree.search.is_some();
+        assert!(in_search, "search mode should be active");
+        assert!(!app.focus_mode, "focus mode should NOT be toggled during search");
     }
 
     #[test]

@@ -16,7 +16,7 @@ pub struct Highlighter {
 
 impl Highlighter {
     pub fn new() -> Self {
-        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let syntax_set = two_face::syntax::extra_newlines();
         let theme_set = ThemeSet::load_defaults();
         // base16-eighties.dark works well on dark terminals
         let theme = theme_set.themes["base16-eighties.dark"].clone();
@@ -99,7 +99,11 @@ mod tests {
     fn detect_syntax_recognizes_javascript_by_extension() {
         let h = Highlighter::new();
         let syntax = h.detect_syntax(Path::new("app.js"), "");
-        assert_eq!(syntax.name, "JavaScript");
+        assert!(
+            syntax.name.contains("JavaScript"),
+            "Expected JavaScript variant, got: {}",
+            syntax.name
+        );
     }
 
     // 2.2: First-line fallback (shebang)
@@ -141,6 +145,31 @@ mod tests {
                 _ => panic!("Expected Rgb color, got {:?}", span.style.fg),
             }
         }
+    }
+
+    #[test]
+    fn detect_syntax_recognizes_typescript_by_extension() {
+        let h = Highlighter::new();
+        let syntax = h.detect_syntax(Path::new("app.ts"), "");
+        assert_eq!(syntax.name, "TypeScript");
+    }
+
+    #[test]
+    fn detect_syntax_recognizes_tsx_by_extension() {
+        let h = Highlighter::new();
+        let syntax = h.detect_syntax(Path::new("component.tsx"), "");
+        assert!(
+            syntax.name.contains("TypeScript"),
+            "Expected TypeScript variant, got: {}",
+            syntax.name
+        );
+    }
+
+    #[test]
+    fn detect_syntax_recognizes_toml_by_extension() {
+        let h = Highlighter::new();
+        let syntax = h.detect_syntax(Path::new("config.toml"), "");
+        assert_eq!(syntax.name, "TOML");
     }
 
     #[test]

@@ -25,6 +25,20 @@ pub struct SearchState {
     root: std::path::PathBuf,
 }
 
+impl SearchState {
+    /// Create a minimal SearchState for testing.
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        Self {
+            query: String::new(),
+            saved_entries: Vec::new(),
+            saved_selected: 0,
+            saved_scroll_offset: 0,
+            root: std::path::PathBuf::new(),
+        }
+    }
+}
+
 /// Time window for double-tap detection.
 const DOUBLE_TAP_THRESHOLD: Duration = Duration::from_millis(400);
 
