@@ -274,6 +274,7 @@ impl App {
                         }
                     }
                 }
+                self.refresh_comment_list();
             }
             Action::ExportComments => {
                 self.export_comments();
@@ -296,6 +297,40 @@ impl App {
                         ));
                     }
                 }
+            }
+            Action::EnterCommentList => {
+                let entries = build_comment_list_entries(&self.comment_store, &self.target_dir);
+                if !entries.is_empty() {
+                    self.file_tree.enter_comment_list(entries);
+                    if let Some(c) = self.file_tree.selected_comment() {
+                        let file = c.file.clone();
+                        let line = c.start_line;
+                        self.file_viewer.load_file(&file);
+                        self.load_diff_for_file(&file);
+                        self.file_viewer.scroll_to_line(line);
+                    }
+                }
+            }
+            Action::CommentFocused { file, line } => {
+                let need_load = self.file_viewer.current_file() != Some(file.as_path());
+                if need_load {
+                    self.file_viewer.load_file(&file);
+                    self.load_diff_for_file(&file);
+                }
+                self.file_viewer.scroll_to_line(line);
+            }
+            Action::DeleteCommentAt { file, start_line, end_line } => {
+                self.comment_store.delete(&file, start_line, end_line);
+                self.refresh_comment_list();
+            }
+            Action::CommentJumped { file, line } => {
+                let need_load = self.file_viewer.current_file() != Some(file.as_path());
+                if need_load {
+                    self.file_viewer.load_file(&file);
+                    self.load_diff_for_file(&file);
+                }
+                self.file_viewer.scroll_to_line(line);
+                self.focus = Focus::Viewer;
             }
             Action::None => {}
         }
@@ -324,6 +359,27 @@ impl App {
                     Instant::now(),
                 ));
             }
+        }
+    }
+
+    /// Rebuild the comment list entries if currently in comment list mode.
+    fn refresh_comment_list(&mut self) {
+        if self.file_tree.is_comment_list_mode() {
+            let entries = build_comment_list_entries(&self.comment_store, &self.target_dir);
+            if entries.is_empty() {
+                self.file_tree.exit_comment_list();
+            } else {
+                self.file_tree.enter_comment_list(entries);
+            }
+        }
+    }
+
+    /// Handle hint bar text when in comment list mode.
+    fn comment_list_hints(&self) -> Option<String> {
+        if self.file_tree.is_comment_list_mode() {
+            Some("j/k navigate  Enter jump  c/Esc back".into())
+        } else {
+            None
         }
     }
 
@@ -615,6 +671,7 @@ fn handle_comment_input(app: &mut App, key: crossterm::event::KeyEvent) {
                 }
             }
             app.input_mode = InputMode::Normal;
+            app.refresh_comment_list();
         }
         KeyCode::Esc => {
             app.input_mode = InputMode::Normal;
@@ -960,6 +1017,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
         InputMode::Normal => {
             if let Some((msg, color, _)) = &app.flash_message {
                 (msg.clone(), *color)
+            } else if let Some(hints) = app.comment_list_hints() {
+                (hints, Color::DarkGray)
             } else if app.file_tree.search.is_some() {
                 ("Enter confirm  Esc cancel  ↑/↓ navigate".into(), Color::DarkGray)
             } else {
@@ -990,6 +1049,7 @@ fn draw_help_dialog(buf: &mut ratatui::buffer::Buffer, area: Rect) {
         "   h/l           fold/unfold",
         "   /             search",
         "   g             changed files",
+        "   c             comment list",
         "",
         " Viewer",
         "   d             toggle diff",
@@ -1046,6 +1106,50 @@ fn draw_help_dialog(buf: &mut ratatui::buffer::Buffer, area: Rect) {
         let line = Line::from(Span::styled(*line_text, st));
         buf.set_line(inner.x, inner.y + i as u16, &line, inner.width);
     }
+}
+
+/// Build a flat list of comment entries grouped by file for the comment list view.
+fn build_comment_list_entries(
+    store: &CommentStore,
+    root: &std::path::Path,
+) -> Vec<crate::file_tree::CommentListEntry> {
+    use std::collections::BTreeMap;
+
+    let mut by_file: BTreeMap<&std::path::Path, Vec<&crate::comments::Comment>> = BTreeMap::new();
+    for file_path in store.files_with_comments() {
+        let comments = store.for_file(file_path);
+        by_file.insert(file_path, comments);
+    }
+
+    let mut entries = Vec::new();
+    for (file, mut comments) in by_file {
+        comments.sort_by_key(|c| c.start_line);
+        let display_name = file
+            .strip_prefix(root)
+            .unwrap_or(file)
+            .display()
+            .to_string();
+        entries.push(crate::file_tree::CommentListEntry {
+            file: file.to_path_buf(),
+            start_line: 0,
+            end_line: 0,
+            text: String::new(),
+            is_header: true,
+            display_name: display_name.clone(),
+        });
+        for c in comments {
+            let first_line = c.text.lines().next().unwrap_or("").to_string();
+            entries.push(crate::file_tree::CommentListEntry {
+                file: c.file.clone(),
+                start_line: c.start_line,
+                end_line: c.end_line,
+                text: first_line,
+                is_header: false,
+                display_name: display_name.clone(),
+            });
+        }
+    }
+    entries
 }
 
 #[cfg(test)]

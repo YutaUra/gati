@@ -15,6 +15,25 @@ use crate::components::{Action, Component};
 use crate::git_status::{FileStatus, GitStatus};
 use crate::tree::{self, FileTreeModel, TreeEntry};
 
+/// Entry in the comment list display.
+#[derive(Debug, Clone)]
+pub struct CommentListEntry {
+    pub file: PathBuf,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub text: String,
+    pub is_header: bool,
+    /// Relative path from project root, used as the header display name.
+    pub display_name: String,
+}
+
+/// State for the comment list view.
+struct CommentListState {
+    entries: Vec<CommentListEntry>,
+    selected: usize,
+    scroll_offset: usize,
+}
+
 /// Search mode state.
 pub struct SearchState {
     pub query: String,
@@ -54,6 +73,8 @@ pub struct FileTree {
     pub last_expand_time: Option<Instant>,
     /// Timestamp of last collapse action (for double-tap fold-to-root).
     pub last_collapse_time: Option<Instant>,
+    /// Comment list view state (None when in normal file tree mode).
+    comment_list: Option<CommentListState>,
 }
 
 impl FileTree {
@@ -66,6 +87,35 @@ impl FileTree {
             visible_height: 0,
             last_expand_time: None,
             last_collapse_time: None,
+            comment_list: None,
+        })
+    }
+
+    /// Enter comment list mode with the given entries.
+    pub fn enter_comment_list(&mut self, entries: Vec<CommentListEntry>) {
+        // Find the first non-header entry to select
+        let first_comment = entries.iter().position(|e| !e.is_header).unwrap_or(0);
+        self.comment_list = Some(CommentListState {
+            entries,
+            selected: first_comment,
+            scroll_offset: 0,
+        });
+    }
+
+    /// Exit comment list mode, returning to the file tree.
+    pub fn exit_comment_list(&mut self) {
+        self.comment_list = None;
+    }
+
+    /// Whether the file tree is currently in comment list mode.
+    pub fn is_comment_list_mode(&self) -> bool {
+        self.comment_list.is_some()
+    }
+
+    /// Get the currently selected comment entry (non-header), if any.
+    pub fn selected_comment(&self) -> Option<&CommentListEntry> {
+        self.comment_list.as_ref().and_then(|cl| {
+            cl.entries.get(cl.selected).filter(|e| !e.is_header)
         })
     }
 
@@ -81,6 +131,79 @@ impl FileTree {
         } else {
             Style::default().fg(Color::DarkGray)
         };
+
+        // Comment list mode renders differently
+        if let Some(ref cl) = self.comment_list {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .title(" Comments ");
+            let inner = block.inner(area);
+            block.render(area, buf);
+
+            let visible_height = inner.height as usize;
+
+            for (i, entry) in cl
+                .entries
+                .iter()
+                .skip(cl.scroll_offset)
+                .take(visible_height)
+                .enumerate()
+            {
+                let global_idx = cl.scroll_offset + i;
+                let is_selected = global_idx == cl.selected;
+
+                let style = if is_selected {
+                    Style::default().fg(Color::Black).bg(Color::White)
+                } else if entry.is_header {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                };
+
+                let text = if entry.is_header {
+                    let prefix = "\u{25bc} ";
+                    let max_name = (inner.width as usize).saturating_sub(prefix.len());
+                    let name = &entry.display_name;
+                    if name.len() > max_name {
+                        let skip = name.len() - max_name.saturating_sub(1); // 1 for …
+                        format!("{prefix}\u{2026}{}", &name[skip..])
+                    } else {
+                        format!("{prefix}{name}")
+                    }
+                } else {
+                    let line_str = if entry.start_line == entry.end_line {
+                        format!(":{}", entry.start_line)
+                    } else {
+                        format!(":{}-{}", entry.start_line, entry.end_line)
+                    };
+                    // Truncate comment text to fit
+                    let max_text = (inner.width as usize).saturating_sub(line_str.len() + 4);
+                    let truncated = if entry.text.len() > max_text {
+                        format!("{}...", &entry.text[..max_text.saturating_sub(3)])
+                    } else {
+                        entry.text.clone()
+                    };
+                    format!("  {line_str} {truncated}")
+                };
+
+                let line = Line::from(Span::styled(text, style));
+                let y = inner.y + i as u16;
+                if y < inner.y + inner.height {
+                    buf.set_line(inner.x, y, &line, inner.width);
+                }
+            }
+
+            if cl.entries.is_empty() {
+                let msg = Line::from(Span::styled(
+                    "No comments",
+                    Style::default().fg(Color::DarkGray),
+                ));
+                buf.set_line(inner.x, inner.y, &msg, inner.width);
+            }
+
+            return;
+        }
 
         let title = if let Some(ref search) = self.search {
             format!(" Files [/{}] ", search.query)
@@ -418,8 +541,94 @@ impl FileTree {
     }
 }
 
+impl FileTree {
+    /// Handle events when in comment list mode.
+    fn handle_comment_list_event(&mut self, key: KeyEvent) -> anyhow::Result<Action> {
+        let cl = self.comment_list.as_mut().unwrap();
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('j'), KeyModifiers::NONE)
+            | (KeyCode::Down, _)
+            | (KeyCode::Char('k'), KeyModifiers::NONE)
+            | (KeyCode::Up, _) => {
+                let going_down = matches!(key.code, KeyCode::Char('j') | KeyCode::Down);
+                let len = cl.entries.len();
+                if len == 0 {
+                    return Ok(Action::None);
+                }
+                // Move to next/prev non-header entry
+                let mut idx = cl.selected;
+                loop {
+                    if going_down {
+                        if idx + 1 >= len {
+                            break;
+                        }
+                        idx += 1;
+                    } else {
+                        if idx == 0 {
+                            break;
+                        }
+                        idx -= 1;
+                    }
+                    if !cl.entries[idx].is_header {
+                        cl.selected = idx;
+                        // Ensure visible
+                        if cl.selected < cl.scroll_offset {
+                            cl.scroll_offset = cl.selected;
+                        } else if cl.selected >= cl.scroll_offset + self.visible_height.max(1) {
+                            cl.scroll_offset = cl.selected - self.visible_height.max(1) + 1;
+                        }
+                        let entry = &cl.entries[cl.selected];
+                        return Ok(Action::CommentFocused {
+                            file: entry.file.clone(),
+                            line: entry.start_line,
+                        });
+                    }
+                }
+                Ok(Action::None)
+            }
+            (KeyCode::Enter, _) => {
+                if let Some(entry) = cl.entries.get(cl.selected)
+                    && !entry.is_header
+                {
+                    return Ok(Action::CommentJumped {
+                        file: entry.file.clone(),
+                        line: entry.start_line,
+                    });
+                }
+                Ok(Action::None)
+            }
+            (KeyCode::Char('x'), KeyModifiers::NONE)
+            | (KeyCode::Delete, _)
+            | (KeyCode::Backspace, _) => {
+                if let Some(entry) = cl.entries.get(cl.selected)
+                    && !entry.is_header
+                {
+                    return Ok(Action::DeleteCommentAt {
+                        file: entry.file.clone(),
+                        start_line: entry.start_line,
+                        end_line: entry.end_line,
+                    });
+                }
+                Ok(Action::None)
+            }
+            (KeyCode::Char('c'), KeyModifiers::NONE) | (KeyCode::Esc, _) => {
+                self.exit_comment_list();
+                Ok(Action::None)
+            }
+            (KeyCode::Tab, _) => Ok(Action::SwitchFocus),
+            (KeyCode::Char('q'), KeyModifiers::NONE) => Ok(Action::Quit),
+            _ => Ok(Action::None),
+        }
+    }
+}
+
 impl Component for FileTree {
     fn handle_event(&mut self, key: KeyEvent) -> anyhow::Result<Action> {
+        // Comment list mode handles its own events
+        if self.comment_list.is_some() {
+            return self.handle_comment_list_event(key);
+        }
+
         // Search mode handles its own events
         if self.search.is_some() {
             return self.handle_search_event(key);
@@ -497,6 +706,7 @@ impl Component for FileTree {
                 self.ensure_visible(self.visible_height);
                 Ok(Action::None)
             }
+            (KeyCode::Char('c'), KeyModifiers::NONE) => Ok(Action::EnterCommentList),
             (KeyCode::Tab, _) => Ok(Action::SwitchFocus),
             (KeyCode::Char('q'), KeyModifiers::NONE) => Ok(Action::Quit),
             _ => Ok(Action::None),

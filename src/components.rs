@@ -23,6 +23,24 @@ pub enum Action {
     DeleteComment,
     /// User pressed `B` to open bug report / feedback URL.
     BugReport,
+    /// Enter comment list mode (tree → app → tree).
+    EnterCommentList,
+    /// A comment in the list was focused — preview file at line.
+    CommentFocused {
+        file: std::path::PathBuf,
+        line: usize,
+    },
+    /// Enter was pressed on a comment — jump to file at line.
+    CommentJumped {
+        file: std::path::PathBuf,
+        line: usize,
+    },
+    /// Delete a specific comment identified by file and line range.
+    DeleteCommentAt {
+        file: std::path::PathBuf,
+        start_line: usize,
+        end_line: usize,
+    },
 }
 
 /// Trait for TUI components.

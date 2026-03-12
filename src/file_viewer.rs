@@ -1342,6 +1342,13 @@ impl FileViewer {
         self.ensure_cursor_visible();
     }
 
+    /// Scroll to a specific line (1-indexed) and place the cursor there.
+    pub fn scroll_to_line(&mut self, line: usize) {
+        self.cursor_line = line.saturating_sub(1);
+        self.cursor_on_comment = None;
+        self.ensure_cursor_visible();
+    }
+
     /// Get the path of the currently loaded file, if any.
     pub fn current_file(&self) -> Option<&Path> {
         match &self.content {
@@ -1380,7 +1387,9 @@ impl Component for FileViewer {
                 Ok(Action::None)
             }
             (KeyCode::Char('c'), KeyModifiers::NONE) => Ok(Action::StartComment),
-            (KeyCode::Char('x'), KeyModifiers::NONE) => Ok(Action::DeleteComment),
+            (KeyCode::Char('x'), KeyModifiers::NONE)
+            | (KeyCode::Delete, _)
+            | (KeyCode::Backspace, _) => Ok(Action::DeleteComment),
             (KeyCode::Char('V'), KeyModifiers::SHIFT) => Ok(Action::StartLineSelect),
             (KeyCode::Char('e'), KeyModifiers::NONE) => Ok(Action::ExportComments),
             (KeyCode::Char('B'), KeyModifiers::SHIFT) => Ok(Action::BugReport),
