@@ -209,43 +209,9 @@ impl App {
                     Focus::Viewer => Focus::Tree,
                 };
             }
-            Action::FileSelected(path) => {
-                self.file_viewer.load_file(&path);
-                self.load_diff_for_file(&path);
-            }
-            Action::FileOpened(path) => {
-                self.file_viewer.load_file(&path);
-                self.load_diff_for_file(&path);
-                self.focus = Focus::Viewer;
-            }
-            Action::StartComment => {
-                if let Some(file) = self.file_viewer.current_file() {
-                    let file = file.to_path_buf();
-                    if let Some((start, end)) = self.file_viewer.cursor_on_comment {
-                        // Cursor is on a comment row → edit that specific comment
-                        let existing_text = self
-                            .comment_store
-                            .find_exact(&file, start, end)
-                            .map(|c| c.text.clone())
-                            .unwrap_or_default();
-                        self.input_mode = InputMode::CommentInput {
-                            file,
-                            start_line: start,
-                            end_line: end,
-                            text: existing_text,
-                        };
-                    } else if let Some(line) = self.file_viewer.cursor_file_line() {
-                        // Cursor is on a code line → always new comment
-                        self.input_mode = InputMode::CommentInput {
-                            file,
-                            start_line: line,
-                            end_line: line,
-                            text: String::new(),
-                        };
-                    }
-                    // If cursor_file_line() is None (Removed line in diff), do nothing
-                }
-            }
+            Action::FileSelected(path) => self.handle_file_action(&path, false),
+            Action::FileOpened(path) => self.handle_file_action(&path, true),
+            Action::StartComment => self.start_comment(),
             Action::StartLineSelect => {
                 if let Some(file) = self.file_viewer.current_file()
                     && let Some(line) = self.file_viewer.cursor_file_line() {
@@ -256,27 +222,12 @@ impl App {
                         };
                     }
             }
-            Action::DeleteComment => {
-                if let Some(file) = self.file_viewer.current_file() {
-                    let file = file.to_path_buf();
-                    if let Some((start, end)) = self.file_viewer.cursor_on_comment {
-                        // Cursor is on a comment row → delete that specific comment
-                        self.comment_store.delete(&file, start, end);
-                        self.file_viewer.cursor_on_comment = None;
-                    } else if let Some(line) = self.file_viewer.cursor_file_line() {
-                        // Cursor is on a code line → delete comment at that line
-                        if let Some(comment) = self.comment_store.find_at_line(&file, line) {
-                            let start = comment.start_line;
-                            let end = comment.end_line;
-                            self.comment_store.delete(&file, start, end);
-                        }
-                    }
-                }
+            Action::DeleteComment => self.delete_comment_at_cursor(),
+            Action::DeleteCommentAt { file, start_line, end_line } => {
+                self.comment_store.delete(&file, start_line, end_line);
                 self.refresh_comment_list();
             }
-            Action::ExportComments => {
-                self.export_comments();
-            }
+            Action::ExportComments => self.export_comments(),
             Action::BugReport => {
                 let url = crate::bug_report::build_url("Bug report", "");
                 match crate::bug_report::try_open(&url) {
@@ -303,36 +254,91 @@ impl App {
                     if let Some(c) = self.file_tree.selected_comment() {
                         let file = c.file.clone();
                         let line = c.start_line;
-                        self.file_viewer.load_file(&file);
-                        self.load_diff_for_file(&file);
+                        self.handle_file_action(&file, false);
                         self.file_viewer.scroll_to_line(line);
                     }
                 }
             }
             Action::CommentFocused { file, line } => {
-                let need_load = self.file_viewer.current_file() != Some(file.as_path());
-                if need_load {
-                    self.file_viewer.load_file(&file);
-                    self.load_diff_for_file(&file);
-                }
-                self.file_viewer.scroll_to_line(line);
-            }
-            Action::DeleteCommentAt { file, start_line, end_line } => {
-                self.comment_store.delete(&file, start_line, end_line);
-                self.refresh_comment_list();
+                self.navigate_to_file_line(&file, line, false);
             }
             Action::CommentJumped { file, line } => {
-                let need_load = self.file_viewer.current_file() != Some(file.as_path());
-                if need_load {
-                    self.file_viewer.load_file(&file);
-                    self.load_diff_for_file(&file);
-                }
-                self.file_viewer.scroll_to_line(line);
-                self.focus = Focus::Viewer;
+                self.navigate_to_file_line(&file, line, true);
             }
             Action::None => {}
         }
         false
+    }
+
+    /// Load a file into the viewer with its diff, optionally switching focus.
+    fn handle_file_action(&mut self, path: &Path, switch_focus: bool) {
+        self.file_viewer.load_file(path);
+        self.load_diff_for_file(path);
+        if switch_focus {
+            self.focus = Focus::Viewer;
+        }
+    }
+
+    /// Navigate to a specific file and line, loading the file if needed.
+    fn navigate_to_file_line(&mut self, file: &Path, line: usize, switch_focus: bool) {
+        if self.file_viewer.current_file() != Some(file) {
+            self.file_viewer.load_file(file);
+            self.load_diff_for_file(file);
+        }
+        self.file_viewer.scroll_to_line(line);
+        if switch_focus {
+            self.focus = Focus::Viewer;
+        }
+    }
+
+    /// Start a comment at the current cursor position.
+    fn start_comment(&mut self) {
+        if let Some(file) = self.file_viewer.current_file() {
+            let file = file.to_path_buf();
+            if let Some((start, end)) = self.file_viewer.cursor_on_comment {
+                // Cursor is on a comment row → edit that specific comment
+                let existing_text = self
+                    .comment_store
+                    .find_exact(&file, start, end)
+                    .map(|c| c.text.clone())
+                    .unwrap_or_default();
+                self.input_mode = InputMode::CommentInput {
+                    file,
+                    start_line: start,
+                    end_line: end,
+                    text: existing_text,
+                };
+            } else if let Some(line) = self.file_viewer.cursor_file_line() {
+                // Cursor is on a code line → always new comment
+                self.input_mode = InputMode::CommentInput {
+                    file,
+                    start_line: line,
+                    end_line: line,
+                    text: String::new(),
+                };
+            }
+            // If cursor_file_line() is None (Removed line in diff), do nothing
+        }
+    }
+
+    /// Delete the comment at the current cursor position.
+    fn delete_comment_at_cursor(&mut self) {
+        if let Some(file) = self.file_viewer.current_file() {
+            let file = file.to_path_buf();
+            if let Some((start, end)) = self.file_viewer.cursor_on_comment {
+                // Cursor is on a comment row → delete that specific comment
+                self.comment_store.delete(&file, start, end);
+                self.file_viewer.cursor_on_comment = None;
+            } else if let Some(line) = self.file_viewer.cursor_file_line() {
+                // Cursor is on a code line → delete comment at that line
+                if let Some(comment) = self.comment_store.find_at_line(&file, line) {
+                    let start = comment.start_line;
+                    let end = comment.end_line;
+                    self.comment_store.delete(&file, start, end);
+                }
+            }
+        }
+        self.refresh_comment_list();
     }
 
     fn export_comments(&mut self) {
