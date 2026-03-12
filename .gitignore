@@ -3,6 +3,7 @@ CLAUDE.local.md
 
 # Nix
 .direnv/
+result
 
 # Node.js
 node_modules/

@@ -26,6 +26,32 @@
         };
       in
       {
+        packages.default = pkgs.rustPlatform.buildRustPackage {
+          pname = "gati";
+          version = "0.1.0";
+          src = self;
+
+          cargoLock.lockFile = ./Cargo.lock;
+
+          nativeBuildInputs = [ pkgs.pkg-config pkgs.cmake ];
+
+          buildInputs = [ pkgs.oniguruma ];
+
+          RUSTONIG_SYSTEM_LIBONIG = 1;
+
+          # cli_clipboard requires a display server, unavailable in the sandbox
+          checkFlags = [ "--skip=app::tests::export_sets_flash_message_on_success" ];
+
+          meta = with pkgs.lib; {
+            description = "A terminal tool for reviewing code, not writing it";
+            homepage = "https://github.com/YutaUra/gati";
+            license = licenses.mit;
+            maintainers = [ ];
+            mainProgram = "gati";
+            platforms = platforms.unix;
+          };
+        };
+
         devShells.default = pkgs.mkShell {
           buildInputs = [
             # Rust
