@@ -1,9 +1,11 @@
 mod comment_renderer;
 mod content;
+mod highlight_cache;
 mod render_utils;
 
 pub use content::ViewerContent;
 pub(crate) use content::read_and_classify;
+pub(crate) use highlight_cache::HighlightCache;
 pub(crate) use render_utils::{fill_row_bg, gutter_spans, line_number_width, skip_chars_in_spans};
 
 use std::path::Path;
@@ -16,9 +18,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Widget},
 };
-
-use syntect::highlighting::HighlightState;
-use syntect::parsing::ParseState;
 
 use crate::comments::Comment;
 use crate::components::{Action, Component};
@@ -96,35 +95,6 @@ pub struct CommentEditState {
     pub target_line: usize,
     /// Current text being edited.
     pub text: String,
-}
-
-/// Cached syntax highlighting state for incremental highlighting.
-struct HighlightCache {
-    /// Incrementally-computed highlighted spans for file lines.
-    /// May be shorter than total lines; remaining lines are computed on demand
-    /// during render via `ensure_highlighted_up_to`.
-    highlighted_lines: Vec<Vec<Span<'static>>>,
-    /// Saved syntect parse state after the last highlighted line, enabling
-    /// incremental highlighting without replaying from the beginning.
-    hl_parse_state: Option<ParseState>,
-    /// Saved syntect highlight state after the last highlighted line.
-    hl_highlight_state: Option<HighlightState>,
-}
-
-impl HighlightCache {
-    fn new() -> Self {
-        Self {
-            highlighted_lines: Vec::new(),
-            hl_parse_state: None,
-            hl_highlight_state: None,
-        }
-    }
-
-    fn clear(&mut self) {
-        self.highlighted_lines.clear();
-        self.hl_parse_state = None;
-        self.hl_highlight_state = None;
-    }
 }
 
 /// Diff-related state grouped together for organization.
@@ -266,55 +236,6 @@ impl FileViewer {
                 }
             }
         }
-    }
-
-    /// Incrementally compute syntax highlighting up to (exclusive) the given line index.
-    ///
-    /// Syntect is stateful — each line's highlighting depends on all preceding
-    /// lines. We cache the `ParseState` and `HighlightState` after the last
-    /// highlighted line so that subsequent calls resume in O(new_lines) rather
-    /// than replaying from line 0.
-    fn ensure_highlighted_up_to(&mut self, up_to: usize) {
-        let (lines, syntax_name) = match &self.content {
-            ViewerContent::File {
-                lines, syntax_name, ..
-            } => (lines, syntax_name.clone()),
-            _ => return,
-        };
-
-        let already = self.highlight_cache.highlighted_lines.len();
-        let target = up_to.min(lines.len());
-        if already >= target {
-            return;
-        }
-
-        let syntax_ref = self
-            .highlighter
-            .syntax_set
-            .find_syntax_by_name(&syntax_name)
-            .unwrap_or_else(|| self.highlighter.syntax_set.find_syntax_plain_text());
-
-        // Restore saved state or create fresh state for the first call.
-        let mut hl_lines = match (self.highlight_cache.hl_highlight_state.take(), self.highlight_cache.hl_parse_state.take()) {
-            (Some(hs), Some(ps)) => {
-                syntect::easy::HighlightLines::from_state(&self.highlighter.theme, hs, ps)
-            }
-            _ => self.highlighter.new_highlight_state(syntax_ref),
-        };
-
-        // Highlight only the new lines.
-        self.highlight_cache.highlighted_lines.reserve(target - already);
-        for line in &lines[already..target] {
-            let spans = self
-                .highlighter
-                .highlight_line(&mut hl_lines, &format!("{line}\n"));
-            self.highlight_cache.highlighted_lines.push(spans);
-        }
-
-        // Save state for the next incremental call via `state(self)`.
-        let (hs, ps) = hl_lines.state();
-        self.highlight_cache.hl_highlight_state = Some(hs);
-        self.highlight_cache.hl_parse_state = Some(ps);
     }
 
     /// Load a file into the viewer.
@@ -741,7 +662,7 @@ impl FileViewer {
         focused: bool,
         ctx: &ViewerRenderContext,
     ) {
-        // Extract line count to call ensure_highlighted_up_to outside the borrow.
+        // Extract line count to call ensure_up_to outside the borrow.
         let line_count = match &self.content {
             ViewerContent::File { lines, .. } => lines.len(),
             _ => 0,
@@ -750,8 +671,11 @@ impl FileViewer {
         self.auto_scroll_for_editor(content_area.height as usize, ctx.comment_edit);
 
         // Incrementally compute highlights up to the last visible line.
+        // Borrow-split: content, highlight_cache, and highlighter are separate fields.
         let need_up_to = (self.scroll_offset + content_area.height as usize).min(line_count);
-        self.ensure_highlighted_up_to(need_up_to);
+        if let ViewerContent::File { lines, syntax_name, .. } = &self.content {
+            self.highlight_cache.ensure_up_to(need_up_to, lines, syntax_name, &self.highlighter);
+        }
 
         let gutter_width = line_number_width(line_count);
         let has_diff = self.diff.line_diff.is_some();
