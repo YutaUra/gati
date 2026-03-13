@@ -1,3 +1,8 @@
+mod comment_renderer;
+mod render_utils;
+
+pub(crate) use render_utils::{fill_row_bg, gutter_spans, line_number_width, skip_chars_in_spans};
+
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -14,7 +19,6 @@ use syntect::parsing::ParseState;
 
 use crate::comments::Comment;
 use crate::components::{Action, Component};
-use crate::unicode;
 
 use crate::diff::{DiffLineKind, LineDiff, UnifiedDiff, UnifiedDiffLine};
 use crate::highlight::Highlighter;
@@ -748,29 +752,6 @@ impl FileViewer {
     }
 
     /// Build gutter spans (diff marker + line number) for a single line.
-    fn gutter_spans(&self, line_num: usize, gutter_width: usize, has_diff: bool) -> Vec<Span<'static>> {
-        let mut spans = Vec::new();
-        if has_diff {
-            let kind = self
-                .diff.line_diff
-                .as_ref()
-                .map(|d: &LineDiff| d.line_kind(line_num))
-                .unwrap_or(DiffLineKind::Unchanged);
-            let (marker, color) = match kind {
-                DiffLineKind::Modified => ("▎", Some(Color::Yellow)),
-                DiffLineKind::Added => ("▎", Some(Color::Green)),
-                DiffLineKind::Unchanged => (" ", None),
-            };
-            let style = color
-                .map(|c| Style::default().fg(c))
-                .unwrap_or_default();
-            spans.push(Span::styled(marker, style));
-        }
-        let num_str = format!("{:>width$} ", line_num, width = gutter_width);
-        spans.push(Span::styled(num_str, Style::default().fg(Color::DarkGray)));
-        spans
-    }
-
     /// Render file content with gutter, syntax highlighting, and inline comments.
     fn render_file_content(
         &mut self,
@@ -812,7 +793,7 @@ impl FileViewer {
 
             let line_num = code_line_idx + 1;
 
-            let mut spans = self.gutter_spans(line_num, gutter_width, has_diff);
+            let mut spans = gutter_spans(line_num, gutter_width, self.diff.line_diff.as_ref());
 
             // Use pre-computed highlight cache (O(1) per line instead of O(scroll_offset))
             let highlighted = if code_line_idx < self.highlight_cache.highlighted_lines.len() {
@@ -902,7 +883,7 @@ impl FileViewer {
         if editing_this_line {
             if let Some(edit) = ctx.comment_edit {
                 let before = *render_row;
-                self.render_comment_editor(edit, inner, buf, render_row, max_rows);
+                comment_renderer::render_comment_editor(edit, inner, buf, render_row, max_rows);
                 for _ in before..*render_row {
                     self.row_map
                         .push(VisualRowContent::CommentRow(edit.start_line, edit.target_line));
@@ -918,7 +899,7 @@ impl FileViewer {
             let comment_render_start = *render_row;
             let c_start = comment.start_line;
             let c_end = comment.end_line;
-            self.render_comment_block(comment, is_stale, inner, buf, render_row, max_rows);
+            comment_renderer::render_comment_block(comment, is_stale, inner, buf, render_row, max_rows);
             for _ in comment_render_start..*render_row {
                 self.row_map
                     .push(VisualRowContent::CommentRow(c_start, c_end));
@@ -932,87 +913,6 @@ impl FileViewer {
         }
     }
 
-    /// Render an inline comment block (2 rows: header + separator).
-    fn render_comment_block(
-        &self,
-        comment: &Comment,
-        is_stale: bool,
-        inner: Rect,
-        buf: &mut Buffer,
-        render_row: &mut u16,
-        max_rows: u16,
-    ) {
-        let (icon, text_color, sep_color) = if is_stale {
-            ("\u{26a0}\u{fe0f}", Color::Yellow, Color::Yellow)
-        } else {
-            ("\u{1f4ac}", Color::Cyan, Color::DarkGray)
-        };
-        let comment_style = Style::default().fg(text_color).bg(Color::Black);
-
-        // Row 1: range + comment text
-        let range_str = if comment.start_line == comment.end_line {
-            format!("  {icon} L{}: {}", comment.start_line, comment.text)
-        } else {
-            format!(
-                "  {icon} L{}-{}: {}",
-                comment.start_line, comment.end_line, comment.text
-            )
-        };
-
-        let y = inner.y + *render_row;
-        let line = Line::from(Span::styled(&range_str, comment_style));
-        buf.set_line(inner.x, y, &line, inner.width);
-        fill_row_bg(buf, inner.x, y, inner.width, Color::Black);
-        *render_row += 1;
-
-        render_separator(buf, inner, render_row, max_rows, sep_color);
-    }
-
-    /// Render the inline comment editor (single row: prefix + text + cursor).
-    ///
-    /// If the text is wider than the available space, truncate from the left
-    /// so the cursor end is always visible.
-    fn render_comment_editor(
-        &self,
-        edit: &CommentEditState,
-        inner: Rect,
-        buf: &mut Buffer,
-        render_row: &mut u16,
-        max_rows: u16,
-    ) {
-        if *render_row >= max_rows {
-            return;
-        }
-        let style = Style::default().fg(Color::Cyan).bg(Color::Black);
-        let range = if edit.start_line == edit.target_line {
-            format!("L{}", edit.target_line)
-        } else {
-            format!("L{}-{}", edit.start_line, edit.target_line)
-        };
-        let prefix = format!("  ✏️ {}: ", range);
-        let prefix_width = prefix.chars().count();
-        let available = (inner.width as usize).saturating_sub(prefix_width + 1); // +1 for cursor
-
-        // Truncate text from the left if it exceeds available width.
-        // Use char_skip_byte_offset to avoid splitting multi-byte characters.
-        let text_char_count = edit.text.chars().count();
-        let display_text = if text_char_count > available {
-            let skip_chars = text_char_count - available;
-            let byte_offset = unicode::char_skip_byte_offset(&edit.text, skip_chars);
-            &edit.text[byte_offset..]
-        } else {
-            &edit.text
-        };
-
-        let content = format!("{prefix}{display_text}█");
-        let y = inner.y + *render_row;
-        let line = Line::from(Span::styled(&content, style));
-        buf.set_line(inner.x, y, &line, inner.width);
-        fill_row_bg(buf, inner.x, y, inner.width, Color::Black);
-        *render_row += 1;
-
-        render_separator(buf, inner, render_row, max_rows, Color::DarkGray);
-    }
 
     /// Render the minimap with half-block characters for 2x vertical resolution.
     ///
@@ -1415,73 +1315,6 @@ impl Component for FileViewer {
     }
 }
 
-/// Drop the first `skip` characters across a sequence of spans, preserving styles.
-/// Characters that fall entirely within skipped spans are removed; a span that is
-/// partially skipped retains only the remaining suffix with its original style.
-fn skip_chars_in_spans(spans: Vec<Span<'_>>, skip: usize) -> Vec<Span<'static>> {
-    if skip == 0 {
-        return spans
-            .into_iter()
-            .map(|s| Span::styled(s.content.into_owned(), s.style))
-            .collect();
-    }
-
-    let mut remaining = skip;
-    let mut result = Vec::new();
-
-    for span in spans {
-        let char_count = span.content.chars().count();
-        if remaining >= char_count {
-            remaining -= char_count;
-            continue;
-        }
-        if remaining > 0 {
-            // Find byte offset of the `remaining`-th character to avoid
-            // slicing inside a multi-byte character (e.g. →, CJK).
-            let byte_offset = span
-                .content
-                .char_indices()
-                .nth(remaining)
-                .map(|(i, _)| i)
-                .unwrap_or(span.content.len());
-            let sliced = &span.content[byte_offset..];
-            result.push(Span::styled(sliced.to_owned(), span.style));
-            remaining = 0;
-        } else {
-            result.push(Span::styled(span.content.into_owned(), span.style));
-        }
-    }
-
-    result
-}
-
-/// Fill an entire row with the given background color.
-fn fill_row_bg(buf: &mut Buffer, x: u16, y: u16, width: u16, bg: Color) {
-    for col in x..x + width {
-        buf[(col, y)].set_bg(bg);
-    }
-}
-
-/// Render a horizontal separator line ("─") if there is room.
-///
-/// Shared by `render_comment_block` and `render_comment_editor` to avoid
-/// duplicating the same separator rendering code.
-fn render_separator(
-    buf: &mut Buffer,
-    inner: Rect,
-    render_row: &mut u16,
-    max_rows: u16,
-    color: Color,
-) {
-    if *render_row < max_rows {
-        let y = inner.y + *render_row;
-        let sep = "─".repeat(inner.width as usize);
-        let line = Line::from(Span::styled(sep, Style::default().fg(color)));
-        buf.set_line(inner.x, y, &line, inner.width);
-        *render_row += 1;
-    }
-}
-
 /// Read a file and classify its content for display.
 ///
 /// Shared by `load_file` and `reload_content` to avoid duplicating the
@@ -1531,14 +1364,6 @@ fn is_binary(bytes: &[u8]) -> bool {
     bytes[..check_len].contains(&0)
 }
 
-/// Calculate the width needed for line numbers.
-fn line_number_width(total_lines: usize) -> usize {
-    if total_lines == 0 {
-        1
-    } else {
-        total_lines.to_string().len()
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1818,17 +1643,6 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         }
-    }
-
-    // Line number width
-    #[test]
-    fn line_number_width_for_various_sizes() {
-        assert_eq!(line_number_width(1), 1);
-        assert_eq!(line_number_width(9), 1);
-        assert_eq!(line_number_width(10), 2);
-        assert_eq!(line_number_width(99), 2);
-        assert_eq!(line_number_width(100), 3);
-        assert_eq!(line_number_width(1000), 4);
     }
 
     // Tab and q
@@ -2253,50 +2067,6 @@ mod tests {
         viewer.h_scroll = 2;
         viewer.scroll_left();
         assert_eq!(viewer.h_scroll, 0);
-    }
-
-    #[test]
-    fn skip_chars_in_spans_single_span() {
-        let spans = vec![Span::raw("Hello World")];
-        let result = skip_chars_in_spans(spans, 6);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].content.as_ref(), "World");
-    }
-
-    #[test]
-    fn skip_chars_in_spans_multi_span_preserves_style() {
-        let spans = vec![
-            Span::styled("Hello", Style::default().fg(Color::Red)),
-            Span::styled(" World", Style::default().fg(Color::Blue)),
-        ];
-        let result = skip_chars_in_spans(spans, 7);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].content.as_ref(), "orld");
-        assert_eq!(result[0].style, Style::default().fg(Color::Blue));
-    }
-
-    #[test]
-    fn skip_chars_in_spans_skip_exceeding_total_returns_empty() {
-        let spans = vec![Span::raw("Hello")];
-        let result = skip_chars_in_spans(spans, 10);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn skip_chars_in_spans_multibyte_chars() {
-        // "→" is 3 bytes but 1 character; skip should count characters, not bytes
-        let spans = vec![Span::raw(" → hello")];
-        let result = skip_chars_in_spans(spans, 3);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].content.as_ref(), "hello");
-    }
-
-    #[test]
-    fn skip_chars_in_spans_skip_zero_returns_unchanged() {
-        let spans = vec![Span::raw("Hello")];
-        let result = skip_chars_in_spans(spans, 0);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].content.as_ref(), "Hello");
     }
 
     #[test]
