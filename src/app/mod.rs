@@ -1,6 +1,7 @@
+mod git_worker;
+
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -19,11 +20,11 @@ use ratatui::{
 
 use crate::comments::{CommentListEntry, CommentStore};
 use crate::components::{Action, Component};
-use crate::diff;
 use crate::file_tree::FileTree;
 use crate::file_viewer::FileViewer;
-use crate::git_status::GitStatus;
 use crate::watcher::FsWatcher;
+
+use git_worker::{GitStatusWorker, load_file_with_diff, set_diff_for_file};
 
 const MIN_WIDTH: u16 = 40;
 const MIN_HEIGHT: u16 = 10;
@@ -107,28 +108,6 @@ pub enum InputMode {
     },
 }
 
-/// Computes git status on a background thread and sends the result via a channel.
-struct GitStatusWorker {
-    receiver: mpsc::Receiver<Option<GitStatus>>,
-}
-
-impl GitStatusWorker {
-    /// Spawn a background thread to compute git status for `dir`.
-    fn spawn(dir: PathBuf) -> Self {
-        let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || {
-            let status = GitStatus::from_dir(&dir);
-            // Ignore send error — the receiver may have been dropped if the app quit.
-            let _ = sender.send(status);
-        });
-        Self { receiver }
-    }
-
-    /// Non-blocking check for a completed git status result.
-    fn try_recv(&self) -> Option<Option<GitStatus>> {
-        self.receiver.try_recv().ok()
-    }
-}
 
 pub struct App {
     file_tree: FileTree,
@@ -513,33 +492,6 @@ impl App {
     }
 }
 
-/// Load a file and its diff data into the viewer.
-///
-/// Used by `App::new` (before `self` is constructed) and via
-/// `App::handle_file_action` / `App::load_diff_for_file`.
-fn load_file_with_diff(
-    viewer: &mut FileViewer,
-    path: &std::path::Path,
-    git_workdir: &Option<PathBuf>,
-) {
-    viewer.load_file(path);
-    set_diff_for_file(viewer, path, git_workdir);
-}
-
-/// Compute and set diff data for a file in the viewer.
-fn set_diff_for_file(
-    viewer: &mut FileViewer,
-    path: &std::path::Path,
-    git_workdir: &Option<PathBuf>,
-) {
-    if let Some(workdir) = git_workdir {
-        if let Some((line_diff, unified_diff)) = diff::compute_diffs(workdir, path) {
-            viewer.set_diff(Some(line_diff), Some(unified_diff));
-        } else {
-            viewer.set_diff(None, None);
-        }
-    }
-}
 
 pub fn run(target: &super::StartupTarget) -> anyhow::Result<()> {
     install_panic_hook();
