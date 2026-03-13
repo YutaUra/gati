@@ -175,6 +175,7 @@ pub fn compute_diffs(
 /// Compute per-line diff information for a file (working tree vs HEAD).
 ///
 /// Returns `None` if the path is not inside a git repository or an error occurs.
+#[cfg(test)]
 pub fn compute_line_diff(repo_path: &Path, file_path: &Path) -> Option<LineDiff> {
     compute_diffs(repo_path, file_path).map(|(ld, _)| ld)
 }
@@ -182,6 +183,7 @@ pub fn compute_line_diff(repo_path: &Path, file_path: &Path) -> Option<LineDiff>
 /// Compute unified diff for a file (working tree vs HEAD).
 ///
 /// Returns `None` if not inside a git repository or an error occurs.
+#[cfg(test)]
 pub fn compute_unified_diff(repo_path: &Path, file_path: &Path) -> Option<UnifiedDiff> {
     compute_diffs(repo_path, file_path).map(|(_, ud)| ud)
 }
@@ -202,41 +204,9 @@ fn get_head_blob_content(repo: &git2::Repository, rel_path: &Path) -> Option<Str
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
     use tempfile::TempDir;
 
-    /// Canonical path of a TempDir (resolves symlinks like /tmp → /private/tmp on macOS).
-    fn canonical_tmp_path(tmp: &TempDir) -> PathBuf {
-        tmp.path().canonicalize().unwrap()
-    }
-
-    /// Create a git repository with an initial commit containing the given files.
-    fn setup_git_repo(files: &[(&str, &str)]) -> TempDir {
-        let tmp = TempDir::new().unwrap();
-        let repo = git2::Repository::init(tmp.path()).unwrap();
-
-        for (name, content) in files {
-            let file_path = tmp.path().join(name);
-            if let Some(parent) = file_path.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            fs::write(&file_path, content).unwrap();
-        }
-
-        let mut index = repo.index().unwrap();
-        index
-            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
-            .unwrap();
-        index.write().unwrap();
-
-        let tree_id = index.write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
-        let sig = git2::Signature::now("test", "test@test.com").unwrap();
-        repo.commit(Some("HEAD"), &sig, &sig, "initial commit", &tree, &[])
-            .unwrap();
-
-        tmp
-    }
+    use crate::test_helpers::{canonical_tmp_path, setup_git_repo};
 
     #[test]
     fn line_diff_returns_none_outside_git() {

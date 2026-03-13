@@ -163,41 +163,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    /// Canonical path of a TempDir (resolves symlinks like /tmp → /private/tmp on macOS).
-    fn canonical_tmp_path(tmp: &TempDir) -> PathBuf {
-        tmp.path().canonicalize().unwrap()
-    }
-
-    /// Create a git repository in a temp directory with an initial commit.
-    fn setup_git_repo(files: &[(&str, &str)]) -> TempDir {
-        let tmp = TempDir::new().unwrap();
-        let repo = git2::Repository::init(tmp.path()).unwrap();
-
-        // Create files and make initial commit
-        for (name, content) in files {
-            let file_path = tmp.path().join(name);
-            if let Some(parent) = file_path.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            fs::write(&file_path, content).unwrap();
-        }
-
-        // Stage all files
-        let mut index = repo.index().unwrap();
-        index
-            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
-            .unwrap();
-        index.write().unwrap();
-
-        // Create initial commit
-        let tree_id = index.write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
-        let sig = git2::Signature::now("test", "test@test.com").unwrap();
-        repo.commit(Some("HEAD"), &sig, &sig, "initial commit", &tree, &[])
-            .unwrap();
-
-        tmp
-    }
+    use crate::test_helpers::{canonical_tmp_path, setup_git_repo};
 
     #[test]
     fn from_dir_returns_none_outside_git() {

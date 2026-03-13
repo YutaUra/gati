@@ -493,20 +493,10 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    /// Helper to create a temp directory with given structure.
+    use crate::test_helpers::setup_dir_with;
+
     fn setup_dir(files: &[&str], dirs: &[&str]) -> TempDir {
-        let tmp = TempDir::new().unwrap();
-        for d in dirs {
-            fs::create_dir_all(tmp.path().join(d)).unwrap();
-        }
-        for f in files {
-            let path = tmp.path().join(f);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            fs::write(&path, "").unwrap();
-        }
-        tmp
+        setup_dir_with(files, dirs, |_| String::new())
     }
 
     #[test]
@@ -692,30 +682,8 @@ mod tests {
 
     /// Helper: create a git repo with initial commit and return (TempDir, canonical root).
     fn setup_git_repo(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
-        let tmp = TempDir::new().unwrap();
-        let repo = git2::Repository::init(tmp.path()).unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-
-        for (name, content) in files {
-            let file_path = root.join(name);
-            if let Some(parent) = file_path.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            fs::write(&file_path, content).unwrap();
-        }
-
-        let mut index = repo.index().unwrap();
-        index
-            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
-            .unwrap();
-        index.write().unwrap();
-
-        let tree_id = index.write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
-        let sig = git2::Signature::now("test", "test@test.com").unwrap();
-        repo.commit(Some("HEAD"), &sig, &sig, "initial commit", &tree, &[])
-            .unwrap();
-
+        let tmp = crate::test_helpers::setup_git_repo(files);
+        let root = crate::test_helpers::canonical_tmp_path(&tmp);
         (tmp, root)
     }
 

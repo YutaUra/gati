@@ -1,4 +1,14 @@
 use crossterm::event::KeyEvent;
+use ratatui::style::{Color, Style};
+
+/// Compute the border style for a pane: cyan when focused, dark gray otherwise.
+pub fn border_style(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
 
 /// Action returned by a component's event handler.
 #[derive(Debug, Clone, PartialEq)]

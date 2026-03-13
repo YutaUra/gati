@@ -127,11 +127,7 @@ impl FileTree {
         focused: bool,
         commented_files: &HashSet<PathBuf>,
     ) {
-        let border_style = if focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
+        let border_style = crate::components::border_style(focused);
 
         // Comment list mode renders differently
         if self.comment_list.is_some() {
@@ -739,22 +735,12 @@ impl Component for FileTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use tempfile::TempDir;
 
+    use crate::test_helpers::setup_dir_with;
+
     fn setup_dir(files: &[&str], dirs: &[&str]) -> TempDir {
-        let tmp = TempDir::new().unwrap();
-        for d in dirs {
-            fs::create_dir_all(tmp.path().join(d)).unwrap();
-        }
-        for f in files {
-            let path = tmp.path().join(f);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            fs::write(&path, "content").unwrap();
-        }
-        tmp
+        setup_dir_with(files, dirs, |_| "content".into())
     }
 
     fn key(code: KeyCode) -> KeyEvent {

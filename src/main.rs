@@ -11,6 +11,9 @@ mod tree;
 mod unicode;
 mod watcher;
 
+#[cfg(test)]
+mod test_helpers;
+
 use std::path::PathBuf;
 
 use clap::Parser;

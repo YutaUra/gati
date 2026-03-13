@@ -172,23 +172,13 @@ impl App {
             {
                 file_tree.model.selected = idx;
             }
-            file_viewer.load_file(selected_file);
-            if let Some(ref workdir) = git_workdir {
-                let line_diff = diff::compute_line_diff(workdir, selected_file);
-                let unified_diff = diff::compute_unified_diff(workdir, selected_file);
-                file_viewer.set_diff(line_diff, unified_diff);
-            }
+            load_file_with_diff(&mut file_viewer, selected_file, &git_workdir);
         } else {
             // Auto-preview the first file if cursor starts on a file
             if let Some(entry) = file_tree.model.selected_entry()
                 && !entry.is_directory {
                     let path = entry.path.clone();
-                    file_viewer.load_file(&path);
-                    if let Some(ref workdir) = git_workdir {
-                        let line_diff = diff::compute_line_diff(workdir, &path);
-                        let unified_diff = diff::compute_unified_diff(workdir, &path);
-                        file_viewer.set_diff(line_diff, unified_diff);
-                    }
+                    load_file_with_diff(&mut file_viewer, &path, &git_workdir);
                 }
         }
 
@@ -429,12 +419,34 @@ impl App {
     }
 
     fn load_diff_for_file(&mut self, path: &std::path::Path) {
-        if let Some(ref workdir) = self.git_workdir {
-            if let Some((line_diff, unified_diff)) = diff::compute_diffs(workdir, path) {
-                self.file_viewer.set_diff(Some(line_diff), Some(unified_diff));
-            } else {
-                self.file_viewer.set_diff(None, None);
-            }
+        set_diff_for_file(&mut self.file_viewer, path, &self.git_workdir);
+    }
+}
+
+/// Load a file and its diff data into the viewer.
+///
+/// Used by `App::new` (before `self` is constructed) and via
+/// `App::handle_file_action` / `App::load_diff_for_file`.
+fn load_file_with_diff(
+    viewer: &mut FileViewer,
+    path: &std::path::Path,
+    git_workdir: &Option<PathBuf>,
+) {
+    viewer.load_file(path);
+    set_diff_for_file(viewer, path, git_workdir);
+}
+
+/// Compute and set diff data for a file in the viewer.
+fn set_diff_for_file(
+    viewer: &mut FileViewer,
+    path: &std::path::Path,
+    git_workdir: &Option<PathBuf>,
+) {
+    if let Some(workdir) = git_workdir {
+        if let Some((line_diff, unified_diff)) = diff::compute_diffs(workdir, path) {
+            viewer.set_diff(Some(line_diff), Some(unified_diff));
+        } else {
+            viewer.set_diff(None, None);
         }
     }
 }
@@ -857,12 +869,7 @@ fn handle_mouse_click(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     }
                 } else {
                     let path = app.file_tree.model.entries[entry_idx].path.clone();
-                    app.file_viewer.load_file(&path);
-                    if let Some(ref workdir) = app.git_workdir {
-                        let line_diff = diff::compute_line_diff(workdir, &path);
-                        let unified_diff = diff::compute_unified_diff(workdir, &path);
-                        app.file_viewer.set_diff(line_diff, unified_diff);
-                    }
+                    app.handle_file_action(&path, false);
                 }
             }
         }
@@ -1190,19 +1197,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
+    use crate::test_helpers::setup_dir_with;
+
     fn setup_dir(files: &[&str], dirs: &[&str]) -> TempDir {
-        let tmp = TempDir::new().unwrap();
-        for d in dirs {
-            fs::create_dir_all(tmp.path().join(d)).unwrap();
-        }
-        for f in files {
-            let path = tmp.path().join(f);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            fs::write(&path, format!("content of {f}")).unwrap();
-        }
-        tmp
+        setup_dir_with(files, dirs, |f| format!("content of {f}"))
     }
 
     fn make_target(dir: &std::path::Path, file: Option<PathBuf>) -> crate::StartupTarget {
@@ -2191,31 +2189,7 @@ mod tests {
     }
 
     // Git diff refresh on filesystem change
-    fn setup_git_repo(files: &[(&str, &str)]) -> TempDir {
-        let tmp = TempDir::new().unwrap();
-        let repo = git2::Repository::init(tmp.path()).unwrap();
-
-        for (name, content) in files {
-            let path = tmp.path().join(name);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            fs::write(&path, content).unwrap();
-        }
-
-        // Initial commit with all files
-        let mut index = repo.index().unwrap();
-        index
-            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
-            .unwrap();
-        index.write().unwrap();
-        let tree_oid = index.write_tree().unwrap();
-        let tree = repo.find_tree(tree_oid).unwrap();
-        let sig = git2::Signature::now("test", "test@test.com").unwrap();
-        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
-
-        tmp
-    }
+    use crate::test_helpers::setup_git_repo;
 
     #[test]
     fn refresh_on_fs_change_recomputes_diff_for_current_file() {
