@@ -17,7 +17,7 @@ use ratatui::{
     DefaultTerminal, Frame,
 };
 
-use crate::comments::CommentStore;
+use crate::comments::{CommentListEntry, CommentStore};
 use crate::components::{Action, Component};
 use crate::diff;
 use crate::file_tree::FileTree;
@@ -64,6 +64,21 @@ pub(crate) struct FlashMessage {
     pub(crate) text: String,
     pub(crate) color: Color,
     pub(crate) created: Instant,
+}
+
+/// Pre-computed data for a single frame, produced by `App::prepare_for_render()`.
+///
+/// Separates business logic (comment loading, staleness, input mode interpretation)
+/// from the rendering path.
+struct RenderData {
+    /// Comments for the current file, each paired with a staleness flag.
+    viewer_comments: Vec<(crate::comments::Comment, bool)>,
+    /// Inline comment editor state (Some when in CommentInput mode).
+    comment_edit: Option<crate::file_viewer::CommentEditState>,
+    /// Line-select range (1-indexed start, end) for V mode / comment input.
+    line_select_range: Option<(usize, usize)>,
+    /// Set of files that have at least one comment (for tree markers).
+    commented_files: std::collections::HashSet<std::path::PathBuf>,
 }
 
 /// Which pane is currently focused.
@@ -170,7 +185,7 @@ impl App {
                 .iter()
                 .position(|e| e.path == *selected_file)
             {
-                file_tree.model.selected = idx;
+                file_tree.model.select_at(idx);
             }
             load_file_with_diff(&mut file_viewer, selected_file, &git_workdir);
         } else {
@@ -253,9 +268,11 @@ impl App {
                 let entries = build_comment_list_entries(&self.comment_store, &self.target_dir);
                 if !entries.is_empty() {
                     self.file_tree.enter_comment_list(entries);
-                    if let Some(c) = self.file_tree.selected_comment() {
-                        let file = c.file.clone();
-                        let line = c.start_line;
+                    if let Some(CommentListEntry::Comment { file, start_line, .. }) =
+                        self.file_tree.selected_comment()
+                    {
+                        let file = file.clone();
+                        let line = *start_line;
                         self.handle_file_action(&file, false);
                         self.file_viewer.scroll_to_line(line);
                     }
@@ -267,9 +284,82 @@ impl App {
             Action::CommentJumped { file, line } => {
                 self.navigate_to_file_line(&file, line, true);
             }
+            Action::CursorDown => {
+                let comments = self.viewer_comments();
+                self.file_viewer.cursor_down(&comments);
+            }
+            Action::CursorUp => {
+                let comments = self.viewer_comments();
+                self.file_viewer.cursor_up(&comments);
+            }
             Action::None => {}
         }
         false
+    }
+
+    /// Compute (comment, is_stale) pairs for the file currently loaded in the viewer.
+    fn viewer_comments(&self) -> Vec<(crate::comments::Comment, bool)> {
+        if let Some(file) = self.file_viewer.current_file() {
+            let file = file.to_path_buf();
+            let current_lines = self.file_viewer.current_lines();
+            self.comment_store
+                .for_file(&file)
+                .into_iter()
+                .map(|c| {
+                    let stale = c.is_stale(current_lines);
+                    (c.clone(), stale)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Compute all render-time data before the actual frame draw.
+    ///
+    /// This keeps business logic (comment loading, staleness checks, input mode
+    /// interpretation) separate from the rendering path, making both easier to
+    /// test and reason about independently.
+    fn prepare_for_render(&self) -> RenderData {
+        let viewer_comments = self.viewer_comments();
+
+        let comment_edit = match &self.input_mode {
+            InputMode::CommentInput {
+                start_line, end_line, text, ..
+            } => Some(crate::file_viewer::CommentEditState {
+                start_line: *start_line,
+                target_line: *end_line,
+                text: text.clone(),
+            }),
+            _ => None,
+        };
+
+        let line_select_range = match &self.input_mode {
+            InputMode::LineSelect { anchor, .. } => {
+                let cursor = self.file_viewer.cursor_file_line().unwrap_or(*anchor);
+                let start = (*anchor).min(cursor);
+                let end = (*anchor).max(cursor);
+                Some((start, end))
+            }
+            InputMode::CommentInput { start_line, end_line, .. } => {
+                Some((*start_line, *end_line))
+            }
+            _ => None,
+        };
+
+        let commented_files = self
+            .comment_store
+            .files_with_comments()
+            .into_iter()
+            .map(|p| p.to_path_buf())
+            .collect();
+
+        RenderData {
+            viewer_comments,
+            comment_edit,
+            line_select_range,
+            commented_files,
+        }
     }
 
     /// Load a file into the viewer with its diff, optionally switching focus.
@@ -728,11 +818,13 @@ fn handle_line_select(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
 
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => {
-            app.file_viewer.cursor_down();
+            let comments = app.viewer_comments();
+            app.file_viewer.cursor_down(&comments);
             true
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            app.file_viewer.cursor_up();
+            let comments = app.viewer_comments();
+            app.file_viewer.cursor_up(&comments);
             true
         }
         KeyCode::Char('c') => {
@@ -857,9 +949,8 @@ fn handle_mouse_click(app: &mut App, mouse: crossterm::event::MouseEvent) {
         if mouse.row >= app.tree_inner_y {
             let inner_row = (mouse.row - app.tree_inner_y) as usize;
             let entry_idx = app.file_tree.scroll_offset + inner_row;
-            if entry_idx < app.file_tree.model.entries.len() {
-                app.file_tree.model.selected = entry_idx;
-                if app.file_tree.model.entries[entry_idx].is_directory {
+            if let Some(entry) = app.file_tree.model.select_at(entry_idx) {
+                if entry.is_directory {
                     if let Err(e) = app.file_tree.model.toggle_expand() {
                         app.flash_message = Some(FlashMessage {
                             text: format!("Toggle expand failed: {}", e),
@@ -868,7 +959,7 @@ fn handle_mouse_click(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         });
                     }
                 } else {
-                    let path = app.file_tree.model.entries[entry_idx].path.clone();
+                    let path = entry.path.clone();
                     app.handle_file_action(&path, false);
                 }
             }
@@ -967,61 +1058,20 @@ fn draw(frame: &mut Frame, app: &mut App) {
     // (render_to_buffer also sets this, but we need it before the first render)
     app.file_tree.visible_height = tree_area.height.saturating_sub(2) as usize;
 
-    // Update file viewer's comments for current file (with staleness info)
-    if let Some(file) = app.file_viewer.current_file() {
-        let file = file.to_path_buf();
-        let current_lines = app.file_viewer.current_lines();
-        app.file_viewer.comments = app
-            .comment_store
-            .for_file(&file)
-            .into_iter()
-            .map(|c| {
-                let stale = c.is_stale(current_lines);
-                (c.clone(), stale)
-            })
-            .collect();
-    } else {
-        app.file_viewer.comments.clear();
-    }
-
-    // Pass inline comment editor state to file viewer
-    app.file_viewer.comment_edit = match &app.input_mode {
-        InputMode::CommentInput {
-            start_line, end_line, text, ..
-        } => Some(crate::file_viewer::CommentEditState {
-            start_line: *start_line,
-            target_line: *end_line,
-            text: text.clone(),
-        }),
-        _ => None,
-    };
-
-    // Pass line-select range to file viewer for V mode and comment input highlighting
-    app.file_viewer.line_select_range = match &app.input_mode {
-        InputMode::LineSelect { anchor, .. } => {
-            let cursor = app.file_viewer.cursor_file_line().unwrap_or(*anchor);
-            let start = (*anchor).min(cursor);
-            let end = (*anchor).max(cursor);
-            Some((start, end))
-        }
-        InputMode::CommentInput { start_line, end_line, .. } => {
-            Some((*start_line, *end_line))
-        }
-        _ => None,
+    // Compute render-time data (business logic separated from draw)
+    let render_data = app.prepare_for_render();
+    let viewer_ctx = crate::file_viewer::ViewerRenderContext {
+        comments: &render_data.viewer_comments,
+        comment_edit: render_data.comment_edit.as_ref(),
+        line_select_range: render_data.line_select_range,
     };
 
     // Render panes
-    let commented_files: std::collections::HashSet<std::path::PathBuf> = app
-        .comment_store
-        .files_with_comments()
-        .into_iter()
-        .map(|p| p.to_path_buf())
-        .collect();
     let buf = frame.buffer_mut();
     app.file_tree
-        .render_to_buffer(tree_area, buf, app.focus == Focus::Tree, &commented_files);
+        .render_to_buffer(tree_area, buf, app.focus == Focus::Tree, &render_data.commented_files);
     app.file_viewer
-        .render_to_buffer(viewer_area, buf, app.focus == Focus::Viewer);
+        .render_to_buffer(viewer_area, buf, app.focus == Focus::Viewer, &viewer_ctx);
 
     // Highlight border when resizing
     if app.resizing && tree_area.right() > 0 {
@@ -1150,7 +1200,7 @@ fn draw_help_dialog(buf: &mut ratatui::buffer::Buffer, area: Rect) {
 fn build_comment_list_entries(
     store: &CommentStore,
     root: &std::path::Path,
-) -> Vec<crate::file_tree::CommentListEntry> {
+) -> Vec<CommentListEntry> {
     use std::collections::BTreeMap;
 
     let mut by_file: BTreeMap<&std::path::Path, Vec<&crate::comments::Comment>> = BTreeMap::new();
@@ -1167,23 +1217,17 @@ fn build_comment_list_entries(
             .unwrap_or(file)
             .display()
             .to_string();
-        entries.push(crate::file_tree::CommentListEntry {
+        entries.push(CommentListEntry::Header {
             file: file.to_path_buf(),
-            start_line: 0,
-            end_line: 0,
-            text: String::new(),
-            is_header: true,
-            display_name: display_name.clone(),
+            display_name,
         });
         for c in comments {
             let first_line = c.text.lines().next().unwrap_or("").to_string();
-            entries.push(crate::file_tree::CommentListEntry {
+            entries.push(CommentListEntry::Comment {
                 file: c.file.clone(),
                 start_line: c.start_line,
                 end_line: c.end_line,
                 text: first_line,
-                is_header: false,
-                display_name: display_name.clone(),
             });
         }
     }
@@ -2201,7 +2245,7 @@ mod tests {
         app.handle_action(Action::FileSelected(file_path.clone()));
 
         // Initially committed, so no diff markers (all unchanged)
-        let has_changes = app.file_viewer.line_diff.as_ref().map_or(false, |d| {
+        let has_changes = app.file_viewer.diff.line_diff.as_ref().map_or(false, |d| {
             d.lines.iter().any(|k| *k != crate::diff::DiffLineKind::Unchanged)
         });
         assert!(!has_changes, "all lines should be unchanged after initial commit");
@@ -2215,7 +2259,7 @@ mod tests {
         // Diff should now show the new line as Added
         let diff = app
             .file_viewer
-            .line_diff
+            .diff.line_diff
             .as_ref()
             .expect("diff should be present after refresh");
         assert_eq!(

@@ -189,6 +189,22 @@ impl FileTreeModel {
         self.entries.get(self.selected)
     }
 
+    /// Select the entry at `idx` and return a reference to it, or None if out of bounds.
+    pub fn select_at(&mut self, idx: usize) -> Option<&TreeEntry> {
+        if idx < self.entries.len() {
+            self.selected = idx;
+            Some(&self.entries[idx])
+        } else {
+            None
+        }
+    }
+
+    /// Return the path of the currently selected entry, if any.
+    #[allow(dead_code)]
+    pub fn selected_path(&self) -> Option<&Path> {
+        self.entries.get(self.selected).map(|e| e.path.as_path())
+    }
+
     /// Get a reference to the git status data.
     pub fn git_status_ref(&self) -> Option<&GitStatus> {
         self.git_status.as_ref()

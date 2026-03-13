@@ -15,6 +15,10 @@ pub fn border_style(focused: bool) -> Style {
 pub enum Action {
     /// No action needed.
     None,
+    /// Move cursor down one line in the viewer.
+    CursorDown,
+    /// Move cursor up one line in the viewer.
+    CursorUp,
     /// Quit the application.
     Quit,
     /// Switch focus to the other pane.

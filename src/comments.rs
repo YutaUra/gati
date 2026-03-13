@@ -1,6 +1,44 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+/// Entry in the comment list display.
+///
+/// The file tree shows a flat list of comments grouped by file.
+/// Header entries introduce each file group; Comment entries show
+/// individual comments with their line range.
+#[derive(Debug, Clone)]
+pub enum CommentListEntry {
+    /// File header row with the file path and a display name (relative path).
+    Header {
+        #[allow(dead_code)]
+        file: PathBuf,
+        display_name: String,
+    },
+    /// Individual comment row with file, line range, and truncated text.
+    Comment {
+        file: PathBuf,
+        start_line: usize,
+        end_line: usize,
+        text: String,
+    },
+}
+
+impl CommentListEntry {
+    /// Whether this entry is a header row.
+    pub fn is_header(&self) -> bool {
+        matches!(self, CommentListEntry::Header { .. })
+    }
+
+    /// The file path associated with this entry.
+    #[allow(dead_code)]
+    pub fn file(&self) -> &Path {
+        match self {
+            CommentListEntry::Header { file, .. } => file,
+            CommentListEntry::Comment { file, .. } => file,
+        }
+    }
+}
+
 /// A single inline comment on a file line or range of lines.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Comment {
@@ -154,6 +192,7 @@ impl CommentStore {
     }
 
     /// Return the number of comments.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.comments.len()
     }
