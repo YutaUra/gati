@@ -6,7 +6,7 @@ use crate::file_viewer::FileViewer;
 use crate::git_status::GitStatus;
 
 /// Computes git status on a background thread and sends the result via a channel.
-pub(super) struct GitStatusWorker {
+pub(crate) struct GitStatusWorker {
     receiver: mpsc::Receiver<Option<GitStatus>>,
 }
 
