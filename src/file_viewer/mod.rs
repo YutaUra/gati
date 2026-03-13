@@ -1,10 +1,12 @@
 mod comment_renderer;
 mod content;
+mod diff_state;
 mod highlight_cache;
 mod render_utils;
 
 pub use content::ViewerContent;
 pub(crate) use content::read_and_classify;
+pub(crate) use diff_state::DiffState;
 pub(crate) use highlight_cache::HighlightCache;
 pub(crate) use render_utils::{fill_row_bg, gutter_spans, line_number_width, skip_chars_in_spans};
 
@@ -97,41 +99,6 @@ pub struct CommentEditState {
     pub text: String,
 }
 
-/// Diff-related state grouped together for organization.
-pub struct DiffState {
-    /// Per-line diff info for gutter markers in normal mode.
-    pub line_diff: Option<LineDiff>,
-    /// Parsed unified diff for diff mode.
-    pub unified_diff: Option<UnifiedDiff>,
-    /// Pre-computed syntax-highlighted spans for each unified diff line.
-    diff_highlighted_lines: Vec<Vec<Span<'static>>>,
-    /// Whether the viewer is currently in diff mode.
-    pub diff_mode: bool,
-    /// Mapping from diff display index → file line number (1-indexed).
-    /// `None` for Removed lines (not in current file), `Some(n)` for Context/Added.
-    diff_line_numbers: Vec<Option<usize>>,
-}
-
-impl DiffState {
-    fn new() -> Self {
-        Self {
-            line_diff: None,
-            unified_diff: None,
-            diff_highlighted_lines: Vec::new(),
-            diff_mode: false,
-            diff_line_numbers: Vec::new(),
-        }
-    }
-
-    fn clear(&mut self) {
-        self.line_diff = None;
-        self.unified_diff = None;
-        self.diff_highlighted_lines.clear();
-        self.diff_mode = false;
-        self.diff_line_numbers.clear();
-    }
-}
-
 pub struct FileViewer {
     pub content: ViewerContent,
     pub scroll_offset: usize,
@@ -180,62 +147,17 @@ impl FileViewer {
     }
 
     /// Set diff data for the currently loaded file.
-    ///
-    /// Syntax highlighting for diff lines is deferred until diff mode is
-    /// actually rendered (see `ensure_diff_highlighted`), avoiding expensive
-    /// O(n) syntect work on every file selection.
     pub fn set_diff(&mut self, line_diff: Option<LineDiff>, unified_diff: Option<UnifiedDiff>) {
-        self.diff.line_diff = line_diff;
-        self.diff.diff_highlighted_lines.clear();
-        self.diff.unified_diff = unified_diff;
-        self.compute_diff_line_numbers();
+        self.diff.set(line_diff, unified_diff);
     }
 
     /// Lazily compute syntax-highlighted spans for unified diff lines.
-    ///
-    /// Called on the first diff-mode render after `set_diff`. Subsequent
-    /// calls are no-ops while the cached highlights remain valid.
     fn ensure_diff_highlighted(&mut self) {
-        if !self.diff.diff_highlighted_lines.is_empty() {
-            return;
-        }
-        let diff = match self.diff.unified_diff {
-            Some(ref d) => d,
-            None => return,
+        let file_path = match &self.content {
+            ViewerContent::File { path, .. } => Some(path.as_path()),
+            _ => None,
         };
-
-        let syntax = match &self.content {
-            ViewerContent::File { path, .. } => {
-                let first_line = diff.lines.iter().find_map(|l| match l {
-                    UnifiedDiffLine::Context(s) | UnifiedDiffLine::Added(s) => Some(s.as_str()),
-                    _ => None,
-                }).unwrap_or("");
-                self.highlighter.detect_syntax(path, first_line).name.clone()
-            }
-            _ => "Plain Text".to_string(),
-        };
-
-        let syntax_ref = self.highlighter.syntax_set
-            .find_syntax_by_name(&syntax)
-            .unwrap_or_else(|| self.highlighter.syntax_set.find_syntax_plain_text());
-        let mut hl_state = self.highlighter.new_highlight_state(syntax_ref);
-
-        for diff_line in &diff.lines {
-            match diff_line {
-                UnifiedDiffLine::HunkHeader(_) => {
-                    self.diff.diff_highlighted_lines.push(Vec::new());
-                }
-                UnifiedDiffLine::Context(s)
-                | UnifiedDiffLine::Added(s)
-                | UnifiedDiffLine::Removed(s) => {
-                    let spans = self.highlighter.highlight_line(
-                        &mut hl_state,
-                        &format!("{s}\n"),
-                    );
-                    self.diff.diff_highlighted_lines.push(spans);
-                }
-            }
-        }
+        self.diff.ensure_highlighted(file_path, &self.highlighter);
     }
 
     /// Load a file into the viewer.
@@ -280,36 +202,11 @@ impl FileViewer {
 
     fn total_lines(&self) -> usize {
         if self.diff.diff_mode {
-            return self.diff.unified_diff.as_ref().map_or(0, |d| {
-                d.lines.iter().filter(|l| !matches!(l, UnifiedDiffLine::HunkHeader(_))).count()
-            });
+            return self.diff.total_lines();
         }
         match &self.content {
             ViewerContent::File { lines, .. } => lines.len(),
             _ => 0,
-        }
-    }
-
-    /// Build the mapping from diff display index to file line number.
-    /// Context/Added lines get `Some(line_number)` (1-indexed);
-    /// Removed lines get `None` (not present in the current file).
-    fn compute_diff_line_numbers(&mut self) {
-        self.diff.diff_line_numbers.clear();
-        let Some(ref diff) = self.diff.unified_diff else {
-            return;
-        };
-        let mut new_lineno: usize = 0;
-        for line in &diff.lines {
-            match line {
-                UnifiedDiffLine::HunkHeader(_) => {}
-                UnifiedDiffLine::Context(_) | UnifiedDiffLine::Added(_) => {
-                    new_lineno += 1;
-                    self.diff.diff_line_numbers.push(Some(new_lineno));
-                }
-                UnifiedDiffLine::Removed(_) => {
-                    self.diff.diff_line_numbers.push(None);
-                }
-            }
         }
     }
 
@@ -318,7 +215,7 @@ impl FileViewer {
     /// `diff_line_numbers` (None for Removed lines).
     pub fn cursor_file_line(&self) -> Option<usize> {
         if self.diff.diff_mode {
-            self.diff.diff_line_numbers.get(self.cursor_line).copied().flatten()
+            self.diff.file_line_at_display(self.cursor_line)
         } else {
             Some(self.cursor_line + 1)
         }
@@ -326,55 +223,17 @@ impl FileViewer {
 
     /// Resolve the file line at the current cursor, falling back to the
     /// nearest file line when sitting on a Removed line in diff mode.
-    /// Searches downward first (Removed→Added is the natural pair), then up.
     fn resolve_nearest_file_line(&self) -> Option<usize> {
-        if let Some(fl) = self.cursor_file_line() {
-            return Some(fl);
+        if !self.diff.diff_mode {
+            return Some(self.cursor_line + 1);
         }
-        // On a Removed line in diff mode – scan neighbours
-        let len = self.diff.diff_line_numbers.len();
-        // Down first (Added lines typically follow Removed lines)
-        for i in (self.cursor_line + 1)..len {
-            if let Some(Some(fl)) = self.diff.diff_line_numbers.get(i) {
-                return Some(*fl);
-            }
-        }
-        // Then up
-        for i in (0..self.cursor_line).rev() {
-            if let Some(Some(fl)) = self.diff.diff_line_numbers.get(i) {
-                return Some(*fl);
-            }
-        }
-        None
-    }
-
-    /// Reverse lookup: given a 1-indexed file line number, find the diff
-    /// display index that maps to it. Returns the exact match or the closest
-    /// display index if no exact match exists.
-    fn diff_display_index_for_file_line(&self, file_line: usize) -> usize {
-        // Exact match
-        if let Some(pos) = self.diff.diff_line_numbers.iter().position(|n| *n == Some(file_line)) {
-            return pos;
-        }
-        // Closest: find the entry with the smallest distance
-        let mut best_idx = 0;
-        let mut best_dist = usize::MAX;
-        for (i, n) in self.diff.diff_line_numbers.iter().enumerate() {
-            if let Some(fl) = n {
-                let dist = (*fl as isize - file_line as isize).unsigned_abs();
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_idx = i;
-                }
-            }
-        }
-        best_idx
+        self.diff.resolve_nearest_file_line(self.cursor_line)
     }
 
     /// Like `cursor_file_line` but for an arbitrary cursor position.
     fn effective_file_line(&self, cursor: usize) -> Option<usize> {
         if self.diff.diff_mode {
-            self.diff.diff_line_numbers.get(cursor).copied().flatten()
+            self.diff.file_line_at_display(cursor)
         } else {
             Some(cursor + 1)
         }
@@ -1157,13 +1016,13 @@ impl Component for FileViewer {
                     self.diff.diff_mode = !self.diff.diff_mode;
                     self.cursor_on_comment = None;
                     if self.diff.diff_mode {
-                        self.compute_diff_line_numbers();
+                        self.diff.compute_line_numbers();
                     }
 
                     // 3. Map the saved file line to the new mode's index
                     if let Some(fl) = file_line {
                         self.cursor_line = if self.diff.diff_mode {
-                            self.diff_display_index_for_file_line(fl)
+                            self.diff.display_index_for_file_line(fl)
                         } else {
                             fl.saturating_sub(1) // 1-indexed → 0-indexed
                         };
@@ -2078,39 +1937,14 @@ mod tests {
         assert!(viewer.cursor_on_comment.is_none());
     }
 
-    // ── diff_line_numbers / cursor_file_line tests ──
+    // ── cursor_file_line / diff integration tests ──
 
     fn make_diff_viewer(diff_lines: Vec<UnifiedDiffLine>) -> FileViewer {
         let mut viewer = FileViewer::new();
         let diff = UnifiedDiff { lines: diff_lines };
         viewer.diff.unified_diff = Some(diff);
-        viewer.compute_diff_line_numbers();
+        viewer.diff.compute_line_numbers();
         viewer
-    }
-
-    #[test]
-    fn compute_diff_line_numbers_context_added_removed() {
-        let viewer = make_diff_viewer(vec![
-            UnifiedDiffLine::Context("ctx1".into()),  // file line 1
-            UnifiedDiffLine::Removed("old".into()),   // None
-            UnifiedDiffLine::Added("new".into()),      // file line 2
-            UnifiedDiffLine::Context("ctx2".into()),  // file line 3
-        ]);
-        assert_eq!(
-            viewer.diff.diff_line_numbers,
-            vec![Some(1), None, Some(2), Some(3)]
-        );
-    }
-
-    #[test]
-    fn compute_diff_line_numbers_skips_hunk_headers() {
-        let viewer = make_diff_viewer(vec![
-            UnifiedDiffLine::HunkHeader("@@ ... @@".into()),
-            UnifiedDiffLine::Context("a".into()),
-            UnifiedDiffLine::Added("b".into()),
-        ]);
-        // HunkHeader should not appear in diff_line_numbers
-        assert_eq!(viewer.diff.diff_line_numbers, vec![Some(1), Some(2)]);
     }
 
     #[test]
@@ -2168,7 +2002,7 @@ mod tests {
                 UnifiedDiffLine::Context("ctx2".into()),  // disp 3, file 3
             ],
         });
-        viewer.compute_diff_line_numbers();
+        viewer.diff.compute_line_numbers();
         let comments = vec![(make_comment(&path, 1, 1), false)]; // comment at file line 1
 
         viewer.cursor_line = 0; // on Context line (file line 1)
@@ -2202,7 +2036,7 @@ mod tests {
                 UnifiedDiffLine::Context("ctx2".into()),  // disp 2, file 3
             ],
         });
-        viewer.compute_diff_line_numbers();
+        viewer.diff.compute_line_numbers();
         let comments = vec![(make_comment(&path, 1, 1), false)]; // comment at file line 1
 
         viewer.cursor_line = 1; // on Added line (file line 2)
@@ -2335,54 +2169,6 @@ mod tests {
     // --- Tests for scroll position preservation on diff/preview toggle ---
 
     #[test]
-    fn diff_display_index_for_file_line_exact_match() {
-        let viewer = make_diff_viewer(vec![
-            UnifiedDiffLine::Context("a".into()),  // idx 0, file 1
-            UnifiedDiffLine::Removed("b".into()),   // idx 1, file None
-            UnifiedDiffLine::Added("c".into()),      // idx 2, file 2
-            UnifiedDiffLine::Context("d".into()),  // idx 3, file 3
-        ]);
-        assert_eq!(viewer.diff_display_index_for_file_line(1), 0);
-        assert_eq!(viewer.diff_display_index_for_file_line(2), 2);
-        assert_eq!(viewer.diff_display_index_for_file_line(3), 3);
-    }
-
-    #[test]
-    fn diff_display_index_for_file_line_nearest() {
-        // Only file lines 5 and 10 exist in the diff
-        let mut viewer = FileViewer::new();
-        viewer.diff.diff_line_numbers = vec![Some(5), None, Some(10)];
-        // file_line 7 is closer to 5 (dist=2) than to 10 (dist=3)
-        assert_eq!(viewer.diff_display_index_for_file_line(7), 0);
-        // file_line 8 is closer to 10 (dist=2) than to 5 (dist=3)
-        assert_eq!(viewer.diff_display_index_for_file_line(8), 2);
-    }
-
-    #[test]
-    fn resolve_nearest_file_line_on_context() {
-        let mut viewer = make_diff_viewer(vec![
-            UnifiedDiffLine::Context("a".into()),
-            UnifiedDiffLine::Added("b".into()),
-        ]);
-        viewer.diff.diff_mode = true;
-        viewer.cursor_line = 0;
-        assert_eq!(viewer.resolve_nearest_file_line(), Some(1));
-    }
-
-    #[test]
-    fn resolve_nearest_file_line_on_removed() {
-        let mut viewer = make_diff_viewer(vec![
-            UnifiedDiffLine::Context("a".into()),  // idx 0, file 1
-            UnifiedDiffLine::Removed("b".into()),   // idx 1, file None
-            UnifiedDiffLine::Added("c".into()),      // idx 2, file 2
-        ]);
-        viewer.diff.diff_mode = true;
-        viewer.cursor_line = 1; // Removed line
-        // Should resolve to file line 2 (next Added line, searching down first)
-        assert_eq!(viewer.resolve_nearest_file_line(), Some(2));
-    }
-
-    #[test]
     fn toggle_preview_to_diff_preserves_position() {
         let content: Vec<u8> = (0..20).map(|i| format!("line {i}\n")).collect::<String>().into();
         let (_tmp, path) = tmp_file("test.txt", &content);
@@ -2427,7 +2213,7 @@ mod tests {
 
         // Start in diff mode
         viewer.diff.diff_mode = true;
-        viewer.compute_diff_line_numbers();
+        viewer.diff.compute_line_numbers();
         viewer.cursor_line = 15;
         viewer.scroll_offset = 11;
         // screen_row = 15 - 11 = 4
@@ -2459,7 +2245,7 @@ mod tests {
                 UnifiedDiffLine::Context("ctx2".into()),  // disp 3, file 3
             ],
         });
-        viewer.compute_diff_line_numbers();
+        viewer.diff.compute_line_numbers();
         viewer.cursor_line = 1; // Removed line
         viewer.scroll_offset = 0;
 
@@ -2488,7 +2274,7 @@ mod tests {
             diff_lines.push(UnifiedDiffLine::Added(format!("line {i}")));
         }
         viewer.diff.unified_diff = Some(UnifiedDiff { lines: diff_lines });
-        viewer.compute_diff_line_numbers();
+        viewer.diff.compute_line_numbers();
         // 10 display lines, cursor at 8, scroll at 5 → screen_row = 3
         viewer.cursor_line = 8;
         viewer.scroll_offset = 5;
