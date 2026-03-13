@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-03-13
+
+### Added
+
+- Comment list view in file tree panel for navigating all comments across files
+- Show gitignored files/directories in file tree with dimmed (DarkGray) styling
+- Refactoring design documents in `docs/plans/`
+
+### Changed
+
+- Decomposed `file_viewer.rs` (2948 lines) into 7 focused modules (content, highlight cache, diff state, minimap, comment renderer, render utilities)
+- Decomposed `app.rs` (2376 lines) into 6 focused modules (git worker, rendering, mouse handling, comment operations, event loop)
+- Consolidated duplicate code patterns (file loading, comment rendering, diff loading, test helpers)
+- Improved encapsulation with `CommentListEntry` enum, `FlashMessage` struct, and `ViewerRenderContext`
+- Replaced `HashMap<PathBuf, bool>` with `HashSet<PathBuf>` for git changed directories
+- Extracted magic numbers into named constants
+
+### Fixed
+
+- UTF-8 byte boundary panics on multi-byte characters (Japanese filenames, emoji in comments, bug report URLs)
+- Safe HashMap indexing for syntax highlighting theme lookup
+- Error handling now shows flash messages instead of silently ignoring filesystem errors
+
 ## [0.6.0] - 2026-03-12
 
 ### Added

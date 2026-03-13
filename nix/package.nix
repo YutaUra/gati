@@ -10,13 +10,13 @@
 
 rustPlatform.buildRustPackage {
   pname = "gati";
-  version = "0.6.0";
+  version = "0.7.0";
 
   src = fetchFromGitHub {
     owner = "YutaUra";
     repo = "gati";
     rev = "v${version}";
-    hash = "sha256-8mZ4D+gHBn7fo0PzRNLpfHUjVEhYQibNMPXYp+uIb/M=";
+    hash = "";
   };
 
   cargoHash = "sha256-XFIbveWGN38n3lna4ZrMB0z8qtnNLgeJixCYaZcYV68=";
