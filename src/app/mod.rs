@@ -1,3 +1,4 @@
+mod comment_ops;
 mod git_worker;
 mod mouse;
 mod render;
@@ -182,7 +183,7 @@ impl App {
             }
             Action::FileSelected(path) => self.handle_file_action(&path, false),
             Action::FileOpened(path) => self.handle_file_action(&path, true),
-            Action::StartComment => self.start_comment(),
+            Action::StartComment => comment_ops::start_comment(self),
             Action::StartLineSelect => {
                 if let Some(file) = self.file_viewer.current_file()
                     && let Some(line) = self.file_viewer.cursor_file_line() {
@@ -193,12 +194,12 @@ impl App {
                         };
                     }
             }
-            Action::DeleteComment => self.delete_comment_at_cursor(),
+            Action::DeleteComment => comment_ops::delete_comment_at_cursor(self),
             Action::DeleteCommentAt { file, start_line, end_line } => {
                 self.comment_store.delete(&file, start_line, end_line);
-                self.refresh_comment_list();
+                comment_ops::refresh_comment_list(self);
             }
-            Action::ExportComments => self.export_comments(),
+            Action::ExportComments => comment_ops::export_comments(self),
             Action::BugReport => {
                 let url = crate::bug_report::build_url("Bug report", "");
                 match crate::bug_report::try_open(&url) {
@@ -219,7 +220,7 @@ impl App {
                 }
             }
             Action::EnterCommentList => {
-                let entries = build_comment_list_entries(&self.comment_store, &self.target_dir);
+                let entries = comment_ops::build_comment_list_entries(&self.comment_store, &self.target_dir);
                 if !entries.is_empty() {
                     self.file_tree.enter_comment_list(entries);
                     if let Some(CommentListEntry::Comment { file, start_line, .. }) =
@@ -334,106 +335,6 @@ impl App {
         self.file_viewer.scroll_to_line(line);
         if switch_focus {
             self.focus = Focus::Viewer;
-        }
-    }
-
-    /// Start a comment at the current cursor position.
-    fn start_comment(&mut self) {
-        if let Some(file) = self.file_viewer.current_file() {
-            let file = file.to_path_buf();
-            if let Some((start, end)) = self.file_viewer.cursor_on_comment {
-                // Cursor is on a comment row → edit that specific comment
-                let existing_text = self
-                    .comment_store
-                    .find_exact(&file, start, end)
-                    .map(|c| c.text.clone())
-                    .unwrap_or_default();
-                self.input_mode = InputMode::CommentInput {
-                    file,
-                    start_line: start,
-                    end_line: end,
-                    text: existing_text,
-                };
-            } else if let Some(line) = self.file_viewer.cursor_file_line() {
-                // Cursor is on a code line → always new comment
-                self.input_mode = InputMode::CommentInput {
-                    file,
-                    start_line: line,
-                    end_line: line,
-                    text: String::new(),
-                };
-            }
-            // If cursor_file_line() is None (Removed line in diff), do nothing
-        }
-    }
-
-    /// Delete the comment at the current cursor position.
-    fn delete_comment_at_cursor(&mut self) {
-        if let Some(file) = self.file_viewer.current_file() {
-            let file = file.to_path_buf();
-            if let Some((start, end)) = self.file_viewer.cursor_on_comment {
-                // Cursor is on a comment row → delete that specific comment
-                self.comment_store.delete(&file, start, end);
-                self.file_viewer.cursor_on_comment = None;
-            } else if let Some(line) = self.file_viewer.cursor_file_line() {
-                // Cursor is on a code line → delete comment at that line
-                if let Some(comment) = self.comment_store.find_at_line(&file, line) {
-                    let start = comment.start_line;
-                    let end = comment.end_line;
-                    self.comment_store.delete(&file, start, end);
-                }
-            }
-        }
-        self.refresh_comment_list();
-    }
-
-    fn export_comments(&mut self) {
-        let text = self.comment_store.export();
-        if text.is_empty() {
-            self.flash_message = Some(FlashMessage {
-                text: "No comments to export".into(),
-                color: Color::Yellow,
-                created: Instant::now(),
-            });
-            return;
-        }
-        match cli_clipboard::set_contents(text) {
-            Ok(_) => {
-                let count = self.comment_store.len();
-                self.flash_message = Some(FlashMessage {
-                    text: format!("Copied {} comment(s) to clipboard", count),
-                    color: Color::Green,
-                    created: Instant::now(),
-                });
-            }
-            Err(_) => {
-                self.flash_message = Some(FlashMessage {
-                    text: "Failed to copy to clipboard".into(),
-                    color: Color::Red,
-                    created: Instant::now(),
-                });
-            }
-        }
-    }
-
-    /// Rebuild the comment list entries if currently in comment list mode.
-    fn refresh_comment_list(&mut self) {
-        if self.file_tree.is_comment_list_mode() {
-            let entries = build_comment_list_entries(&self.comment_store, &self.target_dir);
-            if entries.is_empty() {
-                self.file_tree.exit_comment_list();
-            } else {
-                self.file_tree.enter_comment_list(entries);
-            }
-        }
-    }
-
-    /// Handle hint bar text when in comment list mode.
-    fn comment_list_hints(&self) -> Option<String> {
-        if self.file_tree.is_comment_list_mode() {
-            Some("j/k navigate  Enter jump  c/Esc back".into())
-        } else {
-            None
         }
     }
 
@@ -687,148 +588,14 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<(
     }
 }
 
-fn extract_code_context(
-    content: &crate::file_viewer::ViewerContent,
-    file: &std::path::Path,
-    start_line: usize,
-    end_line: usize,
-) -> Vec<String> {
-    if let crate::file_viewer::ViewerContent::File { path, lines, .. } = content
-        && path == file {
-            let start = start_line.saturating_sub(1).min(lines.len());
-            let end = end_line.min(lines.len());
-            return lines[start..end].to_vec();
-        }
-    vec![]
-}
-
-fn handle_comment_input(app: &mut App, key: crossterm::event::KeyEvent) {
-    use crossterm::event::KeyCode;
-
-    match key.code {
-        KeyCode::Enter => {
-            // Save the comment
-            if let InputMode::CommentInput {
-                ref file,
-                start_line,
-                end_line,
-                ref text,
-            } = app.input_mode
-                && !text.is_empty() {
-                    let code_context =
-                        extract_code_context(&app.file_viewer.content, file, start_line, end_line);
-                    app.comment_store
-                        .add(file, start_line, end_line, text.clone(), code_context);
-                }
-            app.input_mode = InputMode::Normal;
-            app.refresh_comment_list();
-        }
-        KeyCode::Esc => {
-            app.input_mode = InputMode::Normal;
-        }
-        KeyCode::Backspace => {
-            if let InputMode::CommentInput { ref mut text, .. } = app.input_mode {
-                text.pop();
-            }
-        }
-        KeyCode::Char(c) => {
-            if let InputMode::CommentInput { ref mut text, .. } = app.input_mode {
-                text.push(c);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn handle_line_select(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
-    use crossterm::event::KeyCode;
-
-    match key.code {
-        KeyCode::Char('j') | KeyCode::Down => {
-            let comments = app.viewer_comments();
-            app.file_viewer.cursor_down(&comments);
-            true
-        }
-        KeyCode::Char('k') | KeyCode::Up => {
-            let comments = app.viewer_comments();
-            app.file_viewer.cursor_up(&comments);
-            true
-        }
-        KeyCode::Char('c') => {
-            // Open comment input for the selected range
-            if let InputMode::LineSelect { ref file, anchor } = app.input_mode {
-                let current = app.file_viewer.cursor_file_line().unwrap_or(anchor);
-                let start = anchor.min(current);
-                let end = anchor.max(current);
-                let file = file.clone();
-                // Only pre-fill when editing the exact same range;
-                // overlapping or contained ranges should start empty.
-                let existing_text = app
-                    .comment_store
-                    .find_exact(&file, start, end)
-                    .map(|c| c.text.clone())
-                    .unwrap_or_default();
-                app.input_mode = InputMode::CommentInput {
-                    file,
-                    start_line: start,
-                    end_line: end,
-                    text: existing_text,
-                };
-            }
-            true
-        }
-        KeyCode::Esc => {
-            app.input_mode = InputMode::Normal;
-            true
-        }
-        _ => false,
-    }
-}
-
+use comment_ops::{handle_comment_input, handle_line_select};
 use mouse::{handle_mouse, toggle_focus_mode};
 use render::draw;
-
-/// Build a flat list of comment entries grouped by file for the comment list view.
-fn build_comment_list_entries(
-    store: &CommentStore,
-    root: &std::path::Path,
-) -> Vec<CommentListEntry> {
-    use std::collections::BTreeMap;
-
-    let mut by_file: BTreeMap<&std::path::Path, Vec<&crate::comments::Comment>> = BTreeMap::new();
-    for file_path in store.files_with_comments() {
-        let comments = store.for_file(file_path);
-        by_file.insert(file_path, comments);
-    }
-
-    let mut entries = Vec::new();
-    for (file, mut comments) in by_file {
-        comments.sort_by_key(|c| c.start_line);
-        let display_name = file
-            .strip_prefix(root)
-            .unwrap_or(file)
-            .display()
-            .to_string();
-        entries.push(CommentListEntry::Header {
-            file: file.to_path_buf(),
-            display_name,
-        });
-        for c in comments {
-            let first_line = c.text.lines().next().unwrap_or("").to_string();
-            entries.push(CommentListEntry::Comment {
-                file: c.file.clone(),
-                start_line: c.start_line,
-                end_line: c.end_line,
-                text: first_line,
-            });
-        }
-    }
-    entries
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::comment_ops::{extract_code_context, export_comments, handle_comment_input};
     use super::mouse::{clamp_tree_percent, handle_mouse, toggle_focus_mode, MOUSE_SCROLL_LINES};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1916,7 +1683,7 @@ mod tests {
         let mut app = App::new(&make_target(tmp.path(), Some(path.clone()))).unwrap();
         app.comment_store.add(&path, 1, 1, "A comment".into(), vec![]);
 
-        app.export_comments();
+        export_comments(&mut app);
 
         let flash = app.flash_message.as_ref().expect("flash_message should be set");
         assert!(flash.text.contains("1 comment(s)"));
@@ -1928,7 +1695,7 @@ mod tests {
         let tmp = setup_dir(&["file.rs"], &[]);
         let mut app = App::new(&make_target(tmp.path(), None)).unwrap();
 
-        app.export_comments();
+        export_comments(&mut app);
 
         let flash = app.flash_message.as_ref().expect("flash_message should be set");
         assert_eq!(flash.text, "No comments to export");

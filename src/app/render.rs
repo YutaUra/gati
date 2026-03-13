@@ -100,7 +100,7 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         InputMode::Normal => {
             if let Some(flash) = &app.flash_message {
                 (flash.text.clone(), flash.color)
-            } else if let Some(hints) = app.comment_list_hints() {
+            } else if let Some(hints) = super::comment_ops::comment_list_hints(app) {
                 (hints, Color::DarkGray)
             } else if app.file_tree.search.is_some() {
                 ("Enter confirm  Esc cancel  ↑/↓ navigate".into(), Color::DarkGray)
