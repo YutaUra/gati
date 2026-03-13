@@ -28,6 +28,11 @@ use crate::watcher::FsWatcher;
 const MIN_WIDTH: u16 = 40;
 const MIN_HEIGHT: u16 = 10;
 
+/// Default tree pane width as percentage of terminal width.
+const DEFAULT_TREE_WIDTH_PERCENT: u16 = 30;
+/// Width of the help dialog in columns.
+const HELP_DIALOG_WIDTH: u16 = 42;
+
 /// Minimum pane width in columns (absolute floor).
 const MIN_PANE_COLS: u16 = 10;
 /// Minimum pane width as percentage.
@@ -44,7 +49,7 @@ const FLASH_DURATION: Duration = Duration::from_secs(3);
 /// are at least max(MIN_PANE_PERCENT%, MIN_PANE_COLS columns) wide.
 pub fn clamp_tree_percent(desired_cols: u16, terminal_width: u16) -> u16 {
     if terminal_width == 0 {
-        return 30;
+        return DEFAULT_TREE_WIDTH_PERCENT;
     }
     let min_cols = (terminal_width * MIN_PANE_PERCENT / 100).max(MIN_PANE_COLS);
     let max_tree_cols = terminal_width * MAX_TREE_PERCENT / 100;
@@ -52,6 +57,13 @@ pub fn clamp_tree_percent(desired_cols: u16, terminal_width: u16) -> u16 {
     let max_tree_cols = max_tree_cols.min(terminal_width.saturating_sub(min_cols));
     let clamped = desired_cols.clamp(min_cols, max_tree_cols);
     (clamped as u32 * 100 / terminal_width as u32) as u16
+}
+
+/// Temporary flash message shown in the hint bar, auto-dismissed after FLASH_DURATION.
+pub(crate) struct FlashMessage {
+    pub(crate) text: String,
+    pub(crate) color: Color,
+    pub(crate) created: Instant,
 }
 
 /// Which pane is currently focused.
@@ -133,7 +145,7 @@ pub struct App {
     /// Whether the help dialog overlay is currently visible.
     pub show_help: bool,
     /// Temporary flash message shown in the hint bar, auto-dismissed after FLASH_DURATION.
-    pub flash_message: Option<(String, Color, Instant)>,
+    pub flash_message: Option<FlashMessage>,
 }
 
 impl App {
@@ -189,11 +201,11 @@ impl App {
             git_worker,
             comment_store: CommentStore::new(),
             input_mode: InputMode::Normal,
-            tree_width_percent: 30,
+            tree_width_percent: DEFAULT_TREE_WIDTH_PERCENT,
             resizing: false,
             border_column: 0,
             focus_mode: false,
-            saved_tree_width_percent: 30,
+            saved_tree_width_percent: DEFAULT_TREE_WIDTH_PERCENT,
             tree_inner_y: 0,
             show_help: false,
             flash_message: None,
@@ -232,18 +244,18 @@ impl App {
                 let url = crate::bug_report::build_url("Bug report", "");
                 match crate::bug_report::try_open(&url) {
                     crate::bug_report::OpenResult::Opened => {
-                        self.flash_message = Some((
-                            "Opened bug report in browser".into(),
-                            Color::Green,
-                            Instant::now(),
-                        ));
+                        self.flash_message = Some(FlashMessage {
+                            text: "Opened bug report in browser".into(),
+                            color: Color::Green,
+                            created: Instant::now(),
+                        });
                     }
                     crate::bug_report::OpenResult::Failed(e) => {
-                        self.flash_message = Some((
-                            format!("Failed to open browser: {}", e),
-                            Color::Red,
-                            Instant::now(),
-                        ));
+                        self.flash_message = Some(FlashMessage {
+                            text: format!("Failed to open browser: {}", e),
+                            color: Color::Red,
+                            created: Instant::now(),
+                        });
                     }
                 }
             }
@@ -344,24 +356,28 @@ impl App {
     fn export_comments(&mut self) {
         let text = self.comment_store.export();
         if text.is_empty() {
-            self.flash_message = Some(("No comments to export".into(), Color::Yellow, Instant::now()));
+            self.flash_message = Some(FlashMessage {
+                text: "No comments to export".into(),
+                color: Color::Yellow,
+                created: Instant::now(),
+            });
             return;
         }
         match cli_clipboard::set_contents(text) {
             Ok(_) => {
                 let count = self.comment_store.len();
-                self.flash_message = Some((
-                    format!("Copied {} comment(s) to clipboard", count),
-                    Color::Green,
-                    Instant::now(),
-                ));
+                self.flash_message = Some(FlashMessage {
+                    text: format!("Copied {} comment(s) to clipboard", count),
+                    color: Color::Green,
+                    created: Instant::now(),
+                });
             }
             Err(_) => {
-                self.flash_message = Some((
-                    "Failed to copy to clipboard".into(),
-                    Color::Red,
-                    Instant::now(),
-                ));
+                self.flash_message = Some(FlashMessage {
+                    text: "Failed to copy to clipboard".into(),
+                    color: Color::Red,
+                    created: Instant::now(),
+                });
             }
         }
     }
@@ -392,7 +408,13 @@ impl App {
     /// for git status recomputation.
     fn refresh_on_fs_change(&mut self) {
         // Rescan filesystem layout (fast — no git status)
-        let _ = self.file_tree.model.refresh_tree();
+        if let Err(e) = self.file_tree.model.refresh_tree() {
+            self.flash_message = Some(FlashMessage {
+                text: format!("Tree refresh failed: {}", e),
+                color: Color::Red,
+                created: Instant::now(),
+            });
+        }
 
         // Spawn background git status recomputation
         self.git_worker = Some(GitStatusWorker::spawn(self.target_dir.clone()));
@@ -826,7 +848,13 @@ fn handle_mouse_click(app: &mut App, mouse: crossterm::event::MouseEvent) {
             if entry_idx < app.file_tree.model.entries.len() {
                 app.file_tree.model.selected = entry_idx;
                 if app.file_tree.model.entries[entry_idx].is_directory {
-                    let _ = app.file_tree.model.toggle_expand();
+                    if let Err(e) = app.file_tree.model.toggle_expand() {
+                        app.flash_message = Some(FlashMessage {
+                            text: format!("Toggle expand failed: {}", e),
+                            color: Color::Red,
+                            created: Instant::now(),
+                        });
+                    }
                 } else {
                     let path = app.file_tree.model.entries[entry_idx].path.clone();
                     app.file_viewer.load_file(&path);
@@ -999,8 +1027,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     // Clear expired flash messages
-    if let Some((_, _, created)) = &app.flash_message
-        && created.elapsed() >= FLASH_DURATION {
+    if let Some(flash) = &app.flash_message
+        && flash.created.elapsed() >= FLASH_DURATION {
             app.flash_message = None;
         }
 
@@ -1018,8 +1046,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
             ("j/k extend  c comment  Esc cancel".into(), Color::DarkGray)
         }
         InputMode::Normal => {
-            if let Some((msg, color, _)) = &app.flash_message {
-                (msg.clone(), *color)
+            if let Some(flash) = &app.flash_message {
+                (flash.text.clone(), flash.color)
             } else if let Some(hints) = app.comment_list_hints() {
                 (hints, Color::DarkGray)
             } else if app.file_tree.search.is_some() {
@@ -1067,7 +1095,7 @@ fn draw_help_dialog(buf: &mut ratatui::buffer::Buffer, area: Rect) {
         " Press ? or Esc to close",
     ];
 
-    let dialog_w: u16 = 42;
+    let dialog_w: u16 = HELP_DIALOG_WIDTH;
     let dialog_h: u16 = (help_lines.len() as u16) + 2; // +2 for borders
     let w = dialog_w.min(area.width.saturating_sub(2));
     let h = dialog_h.min(area.height.saturating_sub(2));
@@ -2279,9 +2307,9 @@ mod tests {
 
         app.export_comments();
 
-        let (msg, color, _) = app.flash_message.as_ref().expect("flash_message should be set");
-        assert!(msg.contains("1 comment(s)"));
-        assert_eq!(*color, Color::Green);
+        let flash = app.flash_message.as_ref().expect("flash_message should be set");
+        assert!(flash.text.contains("1 comment(s)"));
+        assert_eq!(flash.color, Color::Green);
     }
 
     #[test]
@@ -2291,9 +2319,9 @@ mod tests {
 
         app.export_comments();
 
-        let (msg, color, _) = app.flash_message.as_ref().expect("flash_message should be set");
-        assert_eq!(msg, "No comments to export");
-        assert_eq!(*color, Color::Yellow);
+        let flash = app.flash_message.as_ref().expect("flash_message should be set");
+        assert_eq!(flash.text, "No comments to export");
+        assert_eq!(flash.color, Color::Yellow);
     }
 
     #[test]
@@ -2301,7 +2329,11 @@ mod tests {
         let tmp = setup_dir(&["file.rs"], &[]);
         let path = tmp.path().join("file.rs");
         let mut app = App::new(&make_target(tmp.path(), Some(path.clone()))).unwrap();
-        app.flash_message = Some(("test flash".into(), Color::Green, Instant::now()));
+        app.flash_message = Some(FlashMessage {
+            text: "test flash".into(),
+            color: Color::Green,
+            created: Instant::now(),
+        });
         app.input_mode = InputMode::CommentInput {
             file: path,
             start_line: 1,

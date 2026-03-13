@@ -37,6 +37,23 @@ const H_SCROLL_PADDING: usize = 2;
 /// Extra padding (in lines) added beyond the last line for vertical scroll.
 const V_SCROLL_PADDING: usize = 1;
 
+/// Number of bytes to check for null bytes when detecting binary files.
+const BINARY_CHECK_BYTES: usize = 512;
+/// Number of rows occupied by the inline comment editor (editor + separator).
+const COMMENT_EDITOR_ROWS: usize = 2;
+/// Background color for stale (outdated) comment ranges.
+const STALE_COMMENT_BG: Color = Color::Indexed(52);
+/// Background color for active comment ranges.
+const COMMENT_RANGE_BG: Color = Color::Indexed(236);
+/// Background color for added lines in diff mode.
+const DIFF_ADDED_BG: Color = Color::Rgb(0, 40, 0);
+/// Background color for removed lines in diff mode.
+const DIFF_REMOVED_BG: Color = Color::Rgb(40, 0, 0);
+/// Background color for the minimap area.
+const MINIMAP_BG: Color = Color::Rgb(30, 30, 30);
+/// Color for the viewport indicator in the minimap.
+const MINIMAP_VIEWPORT: Color = Color::Rgb(80, 80, 80);
+
 /// Minimum inner width (in columns) below which the minimap is hidden.
 const MINIMAP_MIN_WIDTH: u16 = 30;
 /// Width of the minimap in terminal columns.
@@ -351,7 +368,14 @@ impl FileViewer {
                 ));
                 return true;
             }
-            Err(_) => return false,
+            Err(e) => {
+                self.content = ViewerContent::Error(format!(
+                    "Cannot read {}: {}",
+                    path.display(),
+                    e,
+                ));
+                return true;
+            }
         };
 
         if is_binary(&bytes) {
@@ -567,12 +591,7 @@ impl FileViewer {
                 MinimapMarker::Comment
             };
             for line_num in comment.start_line..=comment.end_line {
-                let idx = if self.diff_mode {
-                    // In diff mode, approximate position
-                    line_num.saturating_sub(1)
-                } else {
-                    line_num.saturating_sub(1)
-                };
+                let idx = line_num.saturating_sub(1);
                 let row = idx * minimap_height / total.max(1);
                 if row < minimap_height {
                     markers[row] = Some(marker);
@@ -786,7 +805,7 @@ impl FileViewer {
         // target_line (0-indexed) + 2 extra rows to be in viewport.
         if let Some(ref edit) = self.comment_edit {
             let target_idx = edit.target_line.saturating_sub(1); // 0-indexed
-            let editor_rows = 2; // editor + separator
+            let editor_rows = COMMENT_EDITOR_ROWS;
             let need_visible = target_idx + 1 + editor_rows;
             let vh = content_area.height as usize;
             if need_visible > self.scroll_offset + vh {
@@ -852,9 +871,9 @@ impl FileViewer {
             let highlight_bg = if (focused && code_line_idx == self.cursor_line && self.cursor_on_comment.is_none()) || in_line_select {
                 Some(Color::DarkGray)
             } else if in_stale_comment {
-                Some(Color::Indexed(52)) // dark red bg for stale comments
+                Some(STALE_COMMENT_BG)
             } else if in_comment_range {
-                Some(Color::Indexed(236)) // subtle dark bg (#303030)
+                Some(COMMENT_RANGE_BG)
             } else {
                 None
             };
@@ -1052,8 +1071,8 @@ impl FileViewer {
             (0, virtual_h)
         };
 
-        let bg_dim = Color::Rgb(30, 30, 30);
-        let vp_color = Color::Rgb(80, 80, 80);
+        let bg_dim = MINIMAP_BG;
+        let vp_color = MINIMAP_VIEWPORT;
 
         fn marker_color(m: MinimapMarker) -> Color {
             match m {
@@ -1151,7 +1170,7 @@ impl FileViewer {
         // Auto-scroll to keep inline comment editor visible in diff mode.
         if let Some(ref edit) = self.comment_edit {
             let target_idx = edit.target_line.saturating_sub(1); // 0-indexed
-            let editor_rows = 2; // editor + separator
+            let editor_rows = COMMENT_EDITOR_ROWS;
             let need_visible = target_idx + 1 + editor_rows;
             let vh = inner.height as usize;
             if need_visible > self.scroll_offset + vh {
@@ -1222,14 +1241,14 @@ impl FileViewer {
             // Apply background tint for added/removed lines and cursor
             match diff_line {
                 UnifiedDiffLine::Added(_) => {
-                    let bg = if is_cursor_line { Color::DarkGray } else { Color::Rgb(0, 40, 0) };
+                    let bg = if is_cursor_line { Color::DarkGray } else { DIFF_ADDED_BG };
                     for x in inner.x..inner.x + inner.width {
                         let cell = &mut buf[(x, y)];
                         cell.set_bg(bg);
                     }
                 }
                 UnifiedDiffLine::Removed(_) => {
-                    let bg = if is_cursor_line { Color::DarkGray } else { Color::Rgb(40, 0, 0) };
+                    let bg = if is_cursor_line { Color::DarkGray } else { DIFF_REMOVED_BG };
                     for x in inner.x..inner.x + inner.width {
                         let cell = &mut buf[(x, y)];
                         cell.set_bg(bg);
@@ -1516,9 +1535,9 @@ fn skip_chars_in_spans(spans: Vec<Span<'_>>, skip: usize) -> Vec<Span<'static>> 
     result
 }
 
-/// Check if data is binary by looking for null bytes in the first 512 bytes.
+/// Check if data is binary by looking for null bytes in the first N bytes.
 fn is_binary(bytes: &[u8]) -> bool {
-    let check_len = bytes.len().min(512);
+    let check_len = bytes.len().min(BINARY_CHECK_BYTES);
     bytes[..check_len].contains(&0)
 }
 

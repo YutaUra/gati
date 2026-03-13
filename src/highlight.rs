@@ -17,9 +17,20 @@ pub struct Highlighter {
 impl Highlighter {
     pub fn new() -> Self {
         let syntax_set = two_face::syntax::extra_newlines();
-        let theme_set = ThemeSet::load_defaults();
-        // base16-eighties.dark works well on dark terminals
-        let theme = theme_set.themes["base16-eighties.dark"].clone();
+        let mut theme_set = ThemeSet::load_defaults();
+        // base16-eighties.dark works well on dark terminals.
+        // Use .remove() to take ownership without cloning, falling back to
+        // the first available theme if the preferred one is missing.
+        let theme = theme_set
+            .themes
+            .remove("base16-eighties.dark")
+            .unwrap_or_else(|| {
+                theme_set
+                    .themes
+                    .into_values()
+                    .next()
+                    .expect("ThemeSet::load_defaults() should contain at least one theme")
+            });
         Self { syntax_set, theme }
     }
 

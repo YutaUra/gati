@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Git status for a single file.
@@ -31,7 +31,7 @@ pub struct GitStatus {
     /// Per-file status, keyed by absolute path.
     file_statuses: HashMap<PathBuf, FileStatus>,
     /// Directories that contain changed files (absolute paths).
-    changed_dirs: HashMap<PathBuf, bool>,
+    changed_dirs: HashSet<PathBuf>,
 }
 
 impl GitStatus {
@@ -98,12 +98,12 @@ impl GitStatus {
     /// Check if a directory contains any changed files.
     /// Falls back to canonicalized path to handle symlinks.
     pub fn dir_has_changes(&self, path: &Path) -> bool {
-        if self.changed_dirs.contains_key(path) {
+        if self.changed_dirs.contains(path) {
             return true;
         }
         path.canonicalize()
             .ok()
-            .is_some_and(|canonical| self.changed_dirs.contains_key(&canonical))
+            .is_some_and(|canonical| self.changed_dirs.contains(&canonical))
     }
 }
 
@@ -142,15 +142,15 @@ fn map_git2_status(status: git2::Status) -> Option<FileStatus> {
 }
 
 /// Propagate file statuses up to ancestor directories.
-fn propagate_to_dirs(file_statuses: &HashMap<PathBuf, FileStatus>) -> HashMap<PathBuf, bool> {
-    let mut dirs = HashMap::new();
+fn propagate_to_dirs(file_statuses: &HashMap<PathBuf, FileStatus>) -> HashSet<PathBuf> {
+    let mut dirs = HashSet::new();
     for path in file_statuses.keys() {
         let mut parent = path.parent();
         while let Some(p) = parent {
-            if dirs.contains_key(p) {
+            if dirs.contains(p) {
                 break; // Already propagated from another file
             }
-            dirs.insert(p.to_path_buf(), true);
+            dirs.insert(p.to_path_buf());
             parent = p.parent();
         }
     }
