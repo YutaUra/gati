@@ -178,6 +178,23 @@ impl DiffState {
         self.diff_line_numbers.get(display_idx).copied().flatten()
     }
 
+    /// Get the text content of a diff display line at the given index.
+    /// Returns None if out of bounds or no diff data.
+    pub fn line_text_at_display(&self, display_idx: usize) -> Option<&str> {
+        let diff = self.unified_diff.as_ref()?;
+        let displayable: Vec<&UnifiedDiffLine> = diff
+            .lines
+            .iter()
+            .filter(|l| !matches!(l, UnifiedDiffLine::HunkHeader(_)))
+            .collect();
+        match displayable.get(display_idx)? {
+            UnifiedDiffLine::Added(s)
+            | UnifiedDiffLine::Removed(s)
+            | UnifiedDiffLine::Context(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
     /// Count of displayable diff lines (excluding hunk headers).
     pub fn total_lines(&self) -> usize {
         self.unified_diff.as_ref().map_or(0, |d| {

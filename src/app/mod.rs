@@ -43,6 +43,8 @@ pub(super) struct RenderData {
     pub(super) comment_edit: Option<crate::file_viewer::CommentEditState>,
     /// Line-select range (1-indexed start, end) for V mode / comment input.
     pub(super) line_select_range: Option<(usize, usize)>,
+    /// Character-level selection range for mouse drag selection.
+    pub(super) char_select_range: Option<crate::file_viewer::CharSelectRange>,
     /// Set of files that have at least one comment (for tree markers).
     pub(super) commented_files: std::collections::HashSet<std::path::PathBuf>,
 }
@@ -60,16 +62,25 @@ pub enum InputMode {
     /// Normal navigation mode.
     Normal,
     /// Typing a comment. Stores: file path, start_line, end_line, current text.
+    /// `previous` holds the selection mode to restore on Esc.
     CommentInput {
         file: PathBuf,
         start_line: usize,
         end_line: usize,
         text: String,
+        previous: Option<Box<InputMode>>,
     },
     /// Visual line-select mode. Stores: file path, anchor line (1-indexed).
     LineSelect {
         file: PathBuf,
         anchor: usize,
+    },
+    /// Character-level selection mode (mouse drag).
+    /// Stores: file path, anchor line (1-indexed), anchor column (0-indexed char offset).
+    CharSelect {
+        file: PathBuf,
+        anchor_line: usize,
+        anchor_col: usize,
     },
 }
 
@@ -291,6 +302,27 @@ impl App {
             _ => None,
         };
 
+        let char_select_range = match &self.input_mode {
+            InputMode::CharSelect { anchor_line, anchor_col, .. } => {
+                let cursor_line = self.file_viewer.cursor_file_line().unwrap_or(*anchor_line);
+                let cursor_col = self.file_viewer.cursor_col.unwrap_or(0);
+                // Normalize so start <= end
+                let (start_line, start_col, end_line, end_col) =
+                    if (cursor_line, cursor_col) < (*anchor_line, *anchor_col) {
+                        (cursor_line, cursor_col, *anchor_line, *anchor_col)
+                    } else {
+                        (*anchor_line, *anchor_col, cursor_line, cursor_col)
+                    };
+                Some(crate::file_viewer::CharSelectRange {
+                    start_line,
+                    start_col,
+                    end_line,
+                    end_col,
+                })
+            }
+            _ => None,
+        };
+
         let commented_files = self
             .comment_store
             .files_with_comments()
@@ -302,6 +334,7 @@ impl App {
             viewer_comments,
             comment_edit,
             line_select_range,
+            char_select_range,
             commented_files,
         }
     }
@@ -487,6 +520,7 @@ mod tests {
             start_line: 1,
             end_line: 1,
             text: "Fix this".into(),
+            previous: None,
         };
 
         handle_comment_input(
@@ -513,6 +547,7 @@ mod tests {
             start_line: 1,
             end_line: 1,
             text: "Draft".into(),
+            previous: None,
         };
 
         handle_comment_input(
@@ -537,6 +572,7 @@ mod tests {
             start_line: 1,
             end_line: 1,
             text: String::new(),
+            previous: None,
         };
 
         handle_comment_input(
@@ -859,7 +895,7 @@ mod tests {
         app.file_tree.search = Some(crate::file_tree::SearchState::new_for_test());
 
         // Simulate 'b' key via handle_event on the file tree
-        let key = crossterm::event::KeyEvent::new(
+        let _key = crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('b'),
             crossterm::event::KeyModifiers::NONE,
         );
@@ -1230,9 +1266,9 @@ mod tests {
         assert_eq!(app.focus, Focus::Tree); // unchanged
     }
 
-    // Mouse drag line selection
+    // Mouse drag char selection
     #[test]
-    fn mouse_click_on_viewer_enters_line_select() {
+    fn mouse_click_on_viewer_enters_char_select() {
         let tmp = setup_dir(&["file.rs"], &[]);
         let file_path = tmp.path().join("file.rs");
         fs::write(&file_path, "line0\nline1\nline2\nline3\nline4\n").unwrap();
@@ -1252,13 +1288,13 @@ mod tests {
         assert_eq!(app.focus, Focus::Viewer);
         assert_eq!(app.file_viewer.cursor_line, 2);
         match &app.input_mode {
-            InputMode::LineSelect { anchor, .. } => assert_eq!(*anchor, 3),
-            other => panic!("Expected LineSelect, got {:?}", other),
+            InputMode::CharSelect { anchor_line, .. } => assert_eq!(*anchor_line, 3),
+            other => panic!("Expected CharSelect, got {:?}", other),
         }
     }
 
     #[test]
-    fn mouse_drag_extends_line_select() {
+    fn mouse_drag_extends_char_select() {
         let tmp = setup_dir(&["file.rs"], &[]);
         let file_path = tmp.path().join("file.rs");
         fs::write(&file_path, "line0\nline1\nline2\nline3\nline4\n").unwrap();
@@ -1267,13 +1303,13 @@ mod tests {
         app.file_viewer.content_rect = Some(ratatui::layout::Rect::new(31, 1, 69, 20));
         app.file_viewer.scroll_offset = 0;
 
-        // Mouse down at row 2 → cursor_line = 1, anchor = file_line 2
+        // Mouse down at row 2 → cursor_line = 1, anchor_line = file_line 2
         let down = make_mouse_event_at(
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             40, 2,
         );
         handle_mouse(&mut app, down, 100);
-        assert!(matches!(app.input_mode, InputMode::LineSelect { .. }));
+        assert!(matches!(app.input_mode, InputMode::CharSelect { .. }));
 
         // Drag to row 5 → cursor_line = 4, file_line = 5
         let drag = make_mouse_event_at(
@@ -1283,15 +1319,15 @@ mod tests {
         handle_mouse(&mut app, drag, 100);
 
         assert_eq!(app.file_viewer.cursor_line, 4);
-        // Still in LineSelect mode
+        // Still in CharSelect mode
         match &app.input_mode {
-            InputMode::LineSelect { anchor, .. } => assert_eq!(*anchor, 2),
-            other => panic!("Expected LineSelect after drag, got {:?}", other),
+            InputMode::CharSelect { anchor_line, .. } => assert_eq!(*anchor_line, 2),
+            other => panic!("Expected CharSelect after drag, got {:?}", other),
         }
     }
 
     #[test]
-    fn mouse_up_single_line_cancels_line_select() {
+    fn mouse_up_single_position_cancels_char_select() {
         let tmp = setup_dir(&["file.rs"], &[]);
         let file_path = tmp.path().join("file.rs");
         fs::write(&file_path, "line0\nline1\nline2\n").unwrap();
@@ -1300,13 +1336,13 @@ mod tests {
         app.file_viewer.content_rect = Some(ratatui::layout::Rect::new(31, 1, 69, 20));
         app.file_viewer.scroll_offset = 0;
 
-        // Click (no drag) → down + up on same row
+        // Click (no drag) → down + up on same position
         let down = make_mouse_event_at(
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             40, 2,
         );
         handle_mouse(&mut app, down, 100);
-        assert!(matches!(app.input_mode, InputMode::LineSelect { .. }));
+        assert!(matches!(app.input_mode, InputMode::CharSelect { .. }));
 
         let up = make_mouse_event_at(
             crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
@@ -1314,12 +1350,12 @@ mod tests {
         );
         handle_mouse(&mut app, up, 100);
 
-        // Single-line select cancelled on mouse up
+        // Zero-width select cancelled on mouse up
         assert!(matches!(app.input_mode, InputMode::Normal));
     }
 
     #[test]
-    fn mouse_up_multi_line_keeps_line_select() {
+    fn mouse_up_multi_line_keeps_char_select() {
         let tmp = setup_dir(&["file.rs"], &[]);
         let file_path = tmp.path().join("file.rs");
         fs::write(&file_path, "line0\nline1\nline2\nline3\n").unwrap();
@@ -1350,12 +1386,12 @@ mod tests {
         handle_mouse(&mut app, up, 100);
 
         match &app.input_mode {
-            InputMode::LineSelect { anchor, .. } => {
-                assert_eq!(*anchor, 2); // anchor at file line 2
+            InputMode::CharSelect { anchor_line, .. } => {
+                assert_eq!(*anchor_line, 2); // anchor at file line 2
                 let current = app.file_viewer.cursor_file_line().unwrap();
                 assert_eq!(current, 4); // cursor at file line 4
             }
-            other => panic!("Expected LineSelect to persist after multi-line drag, got {:?}", other),
+            other => panic!("Expected CharSelect to persist after multi-line drag, got {:?}", other),
         }
     }
 
@@ -1484,6 +1520,7 @@ mod tests {
             start_line: 1,
             end_line: 1,
             text: String::new(),
+            previous: None,
         };
 
         // In CommentInput mode, hints should show comment-related text, not the flash

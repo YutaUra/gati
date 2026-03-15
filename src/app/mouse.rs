@@ -41,13 +41,18 @@ pub(super) fn toggle_focus_mode(app: &mut App) {
     }
 }
 
-/// Enter LineSelect mode anchored at the current cursor position.
+/// Enter CharSelect mode anchored at the current cursor position.
 /// Called on mouse-down in the viewer content area.
-fn start_mouse_line_select(app: &mut App) {
+fn start_mouse_char_select(app: &mut App) {
     if let Some(file) = app.file_viewer.current_file()
         && let Some(line) = app.file_viewer.cursor_file_line() {
             let file = file.to_path_buf();
-            app.input_mode = InputMode::LineSelect { file, anchor: line };
+            let col = app.file_viewer.cursor_col.unwrap_or(0);
+            app.input_mode = InputMode::CharSelect {
+                file,
+                anchor_line: line,
+                anchor_col: col,
+            };
         }
 }
 
@@ -59,10 +64,11 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent, t
         MouseEventKind::Drag(MouseButton::Left) => handle_mouse_drag(app, mouse, terminal_width),
         MouseEventKind::Up(MouseButton::Left) => {
             app.resizing = false;
-            // If line-select range is a single line (no drag), cancel selection
-            if let InputMode::LineSelect { anchor, .. } = &app.input_mode {
-                let current = app.file_viewer.cursor_file_line().unwrap_or(*anchor);
-                if *anchor == current {
+            // If char-select is zero-width (no drag movement), cancel selection
+            if let InputMode::CharSelect { anchor_line, anchor_col, .. } = &app.input_mode {
+                let current_line = app.file_viewer.cursor_file_line().unwrap_or(*anchor_line);
+                let current_col = app.file_viewer.cursor_col.unwrap_or(0);
+                if *anchor_line == current_line && *anchor_col == current_col {
                     app.input_mode = InputMode::Normal;
                 }
             }
@@ -148,13 +154,13 @@ fn handle_mouse_click(app: &mut App, mouse: crossterm::event::MouseEvent) {
         } else {
             app.focus = Focus::Viewer;
             if app.file_viewer.click_line(mouse.row, mouse.column) {
-                start_mouse_line_select(app);
+                start_mouse_char_select(app);
             }
         }
     } else {
         app.focus = Focus::Viewer;
         if app.file_viewer.click_line(mouse.row, mouse.column) {
-            start_mouse_line_select(app);
+            start_mouse_char_select(app);
         }
     }
 }
@@ -180,8 +186,8 @@ fn handle_mouse_drag(app: &mut App, mouse: crossterm::event::MouseEvent, termina
                 app.tree_width_percent = clamp_tree_percent(mouse.column, terminal_width);
             }
         }
-    } else if matches!(app.input_mode, InputMode::LineSelect { .. }) {
-        // Extend line selection by moving cursor to dragged row
+    } else if matches!(app.input_mode, InputMode::CharSelect { .. }) {
+        // Extend char selection by moving cursor to dragged position
         app.file_viewer.click_line(mouse.row, mouse.column);
     }
 }

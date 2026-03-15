@@ -59,6 +59,7 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         comments: &render_data.viewer_comments,
         comment_edit: render_data.comment_edit.as_ref(),
         line_select_range: render_data.line_select_range,
+        char_select_range: render_data.char_select_range,
     };
 
     // Render panes
@@ -94,8 +95,19 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
             };
             (format!("Editing comment on {}  Enter save  Esc cancel", range), Color::DarkGray)
         }
+        InputMode::CharSelect { .. } => {
+            if let Some(flash) = &app.flash_message {
+                (flash.text.clone(), flash.color)
+            } else {
+                ("y/Ctrl-C yank  c comment  Esc cancel".into(), Color::DarkGray)
+            }
+        }
         InputMode::LineSelect { .. } => {
-            ("j/k extend  c comment  Esc cancel".into(), Color::DarkGray)
+            if let Some(flash) = &app.flash_message {
+                (flash.text.clone(), flash.color)
+            } else {
+                ("j/k extend  y/Ctrl-C yank  c comment  Esc cancel".into(), Color::DarkGray)
+            }
         }
         InputMode::Normal => {
             if let Some(flash) = &app.flash_message {
@@ -123,6 +135,7 @@ fn draw_help_dialog(buf: &mut ratatui::buffer::Buffer, area: Rect) {
     let help_lines = [
         " Navigation",
         "   j/k          cursor up/down",
+        "   \u{2190}/\u{2192}          cursor left/right",
         "   h/l          scroll left/right",
         "   Ctrl-d/u     half-page scroll",
         "   Tab           switch pane",
@@ -138,6 +151,9 @@ fn draw_help_dialog(buf: &mut ratatui::buffer::Buffer, area: Rect) {
         "   d             toggle diff",
         "   c             add comment",
         "   V             line select",
+        "   Shift-\u{2190}/\u{2192}    char select",
+        "   Alt-\u{2190}/\u{2192}      word jump",
+        "   y/Ctrl-C      yank selection",
         "   e             export comments",
         "   b             toggle focus mode",
         "",

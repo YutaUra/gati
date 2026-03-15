@@ -56,6 +56,17 @@ const COMMENT_RANGE_BG: Color = Color::Indexed(236);
 const DIFF_ADDED_BG: Color = Color::Rgb(0, 40, 0);
 /// Background color for removed lines in diff mode.
 const DIFF_REMOVED_BG: Color = Color::Rgb(40, 0, 0);
+/// Character-level selection range, computed in `prepare_for_render()`.
+/// Lines are 1-indexed, columns are 0-indexed character offsets.
+/// `start` is always <= `end` (normalized from anchor + cursor).
+#[derive(Debug, Clone, Copy)]
+pub struct CharSelectRange {
+    pub start_line: usize,
+    pub start_col: usize,
+    pub end_line: usize,
+    pub end_col: usize,
+}
+
 /// Render-time context passed from App to FileViewer for each frame.
 ///
 /// These values are computed in `prepare_for_render()` rather than being
@@ -68,6 +79,8 @@ pub struct ViewerRenderContext<'a> {
     pub comment_edit: Option<&'a CommentEditState>,
     /// Line-select range for V mode highlighting (1-indexed start, end).
     pub line_select_range: Option<(usize, usize)>,
+    /// Character-level selection range for mouse drag highlighting.
+    pub char_select_range: Option<CharSelectRange>,
 }
 
 /// Active inline comment editor state, passed from App before each render.
@@ -87,6 +100,9 @@ pub struct FileViewer {
     pub visible_height: usize,
     /// Cursor line position within the file (0-indexed).
     pub cursor_line: usize,
+    /// Cursor column position within the line (0-indexed char offset).
+    /// Set during mouse click/drag for character-level selection. None when unused.
+    pub cursor_col: Option<usize>,
     /// Horizontal scroll offset in characters (0 = no horizontal scroll).
     pub h_scroll: usize,
     /// Width available for code content in characters (set during render, excludes gutter).
@@ -115,6 +131,7 @@ impl FileViewer {
             scroll_offset: 0,
             visible_height: 20,
             cursor_line: 0,
+            cursor_col: None,
             h_scroll: 0,
             visible_content_width: 0,
             highlighter: Highlighter::new(),
@@ -145,6 +162,7 @@ impl FileViewer {
     pub fn load_file(&mut self, path: &Path) {
         self.scroll_offset = 0;
         self.cursor_line = 0;
+        self.cursor_col = None;
         self.h_scroll = 0;
         self.cursor_on_comment = None;
         self.diff.clear();
@@ -232,6 +250,84 @@ impl FileViewer {
             .map(|(c, stale)| (c, *stale))
     }
 
+    /// Return the character count for a given 0-indexed line.
+    pub fn line_char_count(&self, line_idx: usize) -> usize {
+        if self.diff.diff_mode {
+            // In diff mode, get the text from the diff line
+            self.diff.line_text_at_display(line_idx)
+                .map(|s| s.chars().count())
+                .unwrap_or(0)
+        } else {
+            match &self.content {
+                ViewerContent::File { lines, .. } => {
+                    lines.get(line_idx).map(|l| l.chars().count()).unwrap_or(0)
+                }
+                _ => 0,
+            }
+        }
+    }
+
+    /// Return the text content of a given 0-indexed line.
+    fn line_text(&self, line_idx: usize) -> Option<&str> {
+        if self.diff.diff_mode {
+            self.diff.line_text_at_display(line_idx)
+        } else {
+            match &self.content {
+                ViewerContent::File { lines, .. } => lines.get(line_idx).map(|s| s.as_str()),
+                _ => None,
+            }
+        }
+    }
+
+    /// Move cursor to the start of the previous word.
+    pub fn cursor_word_left(&mut self) {
+        let col = self.cursor_col.unwrap_or(0);
+        let text = self.line_text(self.cursor_line).unwrap_or("").to_string();
+        self.cursor_col = Some(word_boundary_left(&text, col));
+    }
+
+    /// Move cursor to the start of the next word.
+    pub fn cursor_word_right(&mut self) {
+        let col = self.cursor_col.unwrap_or(0);
+        let text = self.line_text(self.cursor_line).unwrap_or("").to_string();
+        self.cursor_col = Some(word_boundary_right(&text, col));
+    }
+
+    /// Return the current gutter width in terminal columns.
+    /// Accounts for diff marker column and line number width.
+    pub fn current_gutter_cols(&self) -> usize {
+        let line_count = if self.diff.diff_mode {
+            // Use file line count for consistent gutter width between modes
+            match &self.content {
+                ViewerContent::File { lines, .. } => lines.len(),
+                _ => self.diff.total_lines(),
+            }
+        } else {
+            match &self.content {
+                ViewerContent::File { lines, .. } => lines.len(),
+                _ => 0,
+            }
+        };
+        let gutter_width = line_number_width(line_count);
+        let has_diff = self.diff.line_diff.is_some() || self.diff.diff_mode;
+        gutter_width + 1 + if has_diff { 1 } else { 0 }
+    }
+
+    /// Convert a terminal x coordinate to a character offset within the line.
+    /// Returns None if the click is on the gutter.
+    pub fn column_from_terminal_x(&self, terminal_col: u16) -> Option<usize> {
+        let cr = self.content_rect?;
+        if terminal_col < cr.x {
+            return None;
+        }
+        let col_in_content = (terminal_col - cr.x) as usize;
+        let gutter = self.current_gutter_cols();
+        if col_in_content < gutter {
+            return None;
+        }
+        Some(col_in_content - gutter + self.h_scroll)
+    }
+
     /// Move the cursor to the line at the given terminal coordinates.
     /// Returns true if the click was within the content area and cursor was moved.
     pub fn click_line(&mut self, row: u16, column: u16) -> bool {
@@ -267,6 +363,15 @@ impl FileViewer {
                 }
             }
         }
+
+        // Track column for character-level selection
+        if let Some(char_col) = self.column_from_terminal_x(column) {
+            let max_col = self.line_char_count(self.cursor_line);
+            self.cursor_col = Some(char_col.min(max_col));
+        } else {
+            self.cursor_col = Some(0);
+        }
+
         true
     }
 
@@ -479,7 +584,46 @@ impl FileViewer {
             let in_comment_range = comment_range_info.is_some();
             let in_stale_comment = comment_range_info.is_some_and(|(_, s)| *s);
 
-            let highlight_bg = if (focused && code_line_idx == self.cursor_line && self.cursor_on_comment.is_none()) || in_line_select {
+            // Check for character-level selection on this line
+            let char_col_range = ctx.char_select_range.and_then(|r| {
+                if line_num < r.start_line || line_num > r.end_line {
+                    return None;
+                }
+                let line_len = match &self.content {
+                    ViewerContent::File { lines, .. } => lines.get(code_line_idx).map(|l| l.chars().count()).unwrap_or(0),
+                    _ => 0,
+                };
+                if r.start_line == r.end_line {
+                    // Single line: highlight start_col..end_col
+                    Some((r.start_col, r.end_col.min(line_len)))
+                } else if line_num == r.start_line {
+                    Some((r.start_col, line_len))
+                } else if line_num == r.end_line {
+                    Some((0, r.end_col.min(line_len)))
+                } else {
+                    // Middle line: full line
+                    Some((0, line_len))
+                }
+            });
+
+            let is_cursor_line = focused && code_line_idx == self.cursor_line && self.cursor_on_comment.is_none();
+
+            // Cursor line: highlight only the gutter line number (White instead of DarkGray)
+            if is_cursor_line && !in_line_select && char_col_range.is_none() {
+                let gutter_end = content_area.x + gutter_cols as u16;
+                for x in content_area.x..gutter_end.min(content_area.x + content_area.width) {
+                    let cell = &mut buf[(x, y)];
+                    if cell.fg == Color::DarkGray {
+                        cell.set_fg(Color::White);
+                    }
+                }
+            }
+
+            // Full-row background for line-select and comment ranges (not for cursor line alone)
+            let highlight_bg = if char_col_range.is_some() {
+                // Char select uses per-cell highlighting below, skip full-row bg
+                None
+            } else if in_line_select {
                 Some(Color::DarkGray)
             } else if in_stale_comment {
                 Some(STALE_COMMENT_BG)
@@ -495,6 +639,43 @@ impl FileViewer {
                     // Keep line numbers readable on dark background
                     if in_comment_range && cell.fg == Color::DarkGray {
                         cell.set_fg(Color::Gray);
+                    }
+                }
+            }
+
+            // Apply character-level selection highlight
+            if let Some((sel_start, sel_end)) = char_col_range {
+                let gutter_x = content_area.x + gutter_cols as u16;
+                // Convert char offsets to terminal x positions accounting for h_scroll
+                let term_start = if sel_start >= self.h_scroll {
+                    gutter_x + (sel_start - self.h_scroll) as u16
+                } else {
+                    gutter_x
+                };
+                let term_end = if sel_end >= self.h_scroll {
+                    gutter_x + (sel_end - self.h_scroll) as u16
+                } else {
+                    gutter_x
+                };
+                let max_x = content_area.x + content_area.width;
+                for x in term_start..term_end.min(max_x) {
+                    let cell = &mut buf[(x, y)];
+                    cell.set_bg(Color::DarkGray);
+                }
+            }
+
+            // Block cursor: invert fg/bg at the cursor character position
+            if is_cursor_line {
+                let col = self.cursor_col.unwrap_or(0);
+                let gutter_x = content_area.x + gutter_cols as u16;
+                if col >= self.h_scroll {
+                    let cursor_x = gutter_x + (col - self.h_scroll) as u16;
+                    if cursor_x < content_area.x + content_area.width {
+                        let cell = &mut buf[(cursor_x, y)];
+                        let fg = cell.fg;
+                        let bg = cell.bg;
+                        cell.set_fg(bg);
+                        cell.set_bg(fg);
                     }
                 }
             }
@@ -670,20 +851,79 @@ impl FileViewer {
             let is_cursor_line = disp_idx == self.cursor_line && self.cursor_on_comment.is_none();
             let file_ln = self.diff.diff_line_numbers.get(disp_idx).copied().flatten();
 
-            // Apply background tint for added/removed lines and cursor
-            match diff_line {
-                UnifiedDiffLine::Added(_) => {
-                    let bg = if is_cursor_line { Color::DarkGray } else { DIFF_ADDED_BG };
-                    fill_row_bg(buf, inner.x, y, inner.width, bg);
+            // Check for character-level selection in diff mode
+            let diff_char_col_range = file_ln.and_then(|ln| {
+                let r = ctx.char_select_range?;
+                if ln < r.start_line || ln > r.end_line {
+                    return None;
                 }
-                UnifiedDiffLine::Removed(_) => {
-                    let bg = if is_cursor_line { Color::DarkGray } else { DIFF_REMOVED_BG };
-                    fill_row_bg(buf, inner.x, y, inner.width, bg);
+                let line_text = match diff_line {
+                    UnifiedDiffLine::Added(s)
+                    | UnifiedDiffLine::Removed(s)
+                    | UnifiedDiffLine::Context(s) => s.as_str(),
+                    _ => "",
+                };
+                let line_len = line_text.chars().count();
+                if r.start_line == r.end_line {
+                    Some((r.start_col, r.end_col.min(line_len)))
+                } else if ln == r.start_line {
+                    Some((r.start_col, line_len))
+                } else if ln == r.end_line {
+                    Some((0, r.end_col.min(line_len)))
+                } else {
+                    Some((0, line_len))
                 }
-                _ => {
-                    if is_cursor_line {
-                        fill_row_bg(buf, inner.x, y, inner.width, Color::DarkGray);
+            });
+
+            // Cursor line: highlight only the gutter line number (White instead of DarkGray)
+            if is_cursor_line {
+                let diff_gutter_end = inner.x + (1 + gutter_width + 1) as u16;
+                for x in inner.x..diff_gutter_end.min(inner.x + inner.width) {
+                    let cell = &mut buf[(x, y)];
+                    if cell.fg == Color::DarkGray {
+                        cell.set_fg(Color::White);
                     }
+                }
+            }
+
+            // Apply background tint for added/removed lines (no longer for cursor line)
+            if diff_char_col_range.is_none() {
+                match diff_line {
+                    UnifiedDiffLine::Added(_) => {
+                        fill_row_bg(buf, inner.x, y, inner.width, DIFF_ADDED_BG);
+                    }
+                    UnifiedDiffLine::Removed(_) => {
+                        fill_row_bg(buf, inner.x, y, inner.width, DIFF_REMOVED_BG);
+                    }
+                    _ => {}
+                }
+            }
+
+            // Apply character-level selection highlight in diff mode
+            if let Some((sel_start, sel_end)) = diff_char_col_range {
+                let diff_gutter_cols = 1 + gutter_width + 1; // prefix + line number + space
+                let gutter_x = inner.x + diff_gutter_cols as u16;
+                let term_start = gutter_x + sel_start as u16;
+                let term_end = gutter_x + sel_end as u16;
+                let max_x = inner.x + inner.width;
+                for x in term_start..term_end.min(max_x) {
+                    let cell = &mut buf[(x, y)];
+                    cell.set_bg(Color::DarkGray);
+                }
+            }
+
+            // Block cursor: invert fg/bg at the cursor character position
+            if is_cursor_line {
+                let col = self.cursor_col.unwrap_or(0);
+                let diff_gutter_cols = 1 + gutter_width + 1;
+                let gutter_x = inner.x + diff_gutter_cols as u16;
+                let cursor_x = gutter_x + col as u16;
+                if cursor_x < inner.x + inner.width {
+                    let cell = &mut buf[(cursor_x, y)];
+                    let fg = cell.fg;
+                    let bg = cell.bg;
+                    cell.set_fg(bg);
+                    cell.set_bg(fg);
                 }
             }
 
@@ -723,6 +963,11 @@ impl FileViewer {
                 self.cursor_line += 1;
             }
         }
+        // Clamp cursor_col to new line length
+        if let Some(col) = self.cursor_col {
+            let max_col = self.line_char_count(self.cursor_line);
+            self.cursor_col = Some(col.min(max_col));
+        }
         self.ensure_cursor_visible();
     }
 
@@ -756,6 +1001,11 @@ impl FileViewer {
                 self.cursor_line -= 1;
             }
         }
+        // Clamp cursor_col to new line length
+        if let Some(col) = self.cursor_col {
+            let max_col = self.line_char_count(self.cursor_line);
+            self.cursor_col = Some(col.min(max_col));
+        }
         self.ensure_cursor_visible();
     }
 
@@ -780,6 +1030,19 @@ impl FileViewer {
             ViewerContent::File { lines, .. } => lines,
             _ => &[],
         }
+    }
+
+    /// Move cursor column left by one character.
+    pub fn cursor_left(&mut self) {
+        let col = self.cursor_col.unwrap_or(0);
+        self.cursor_col = Some(col.saturating_sub(1));
+    }
+
+    /// Move cursor column right by one character, clamped to line length.
+    pub fn cursor_right(&mut self) {
+        let col = self.cursor_col.unwrap_or(0);
+        let max_col = self.line_char_count(self.cursor_line);
+        self.cursor_col = Some((col + 1).min(max_col));
     }
 
     /// Ensure the cursor line is visible within the viewport.
@@ -847,12 +1110,28 @@ impl Component for FileViewer {
                 }
                 Ok(Action::None)
             }
-            (KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Left, _) => {
+            (KeyCode::Char('h'), KeyModifiers::NONE) => {
                 self.scroll_left();
                 Ok(Action::None)
             }
-            (KeyCode::Char('l'), KeyModifiers::NONE) | (KeyCode::Right, _) => {
+            (KeyCode::Left, KeyModifiers::ALT) => {
+                self.cursor_word_left();
+                Ok(Action::None)
+            }
+            (KeyCode::Left, _) => {
+                self.cursor_left();
+                Ok(Action::None)
+            }
+            (KeyCode::Char('l'), KeyModifiers::NONE) => {
                 self.scroll_right();
+                Ok(Action::None)
+            }
+            (KeyCode::Right, KeyModifiers::ALT) => {
+                self.cursor_word_right();
+                Ok(Action::None)
+            }
+            (KeyCode::Right, _) => {
+                self.cursor_right();
                 Ok(Action::None)
             }
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
@@ -879,6 +1158,67 @@ impl Component for FileViewer {
             _ => Ok(Action::None),
         }
     }
+}
+
+/// Find the char offset of the previous word boundary.
+/// A "word" is a run of alphanumeric/underscore chars, or a run of punctuation.
+fn word_boundary_left(text: &str, col: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    if col == 0 {
+        return 0;
+    }
+    let mut pos = col.min(chars.len());
+    // Skip whitespace going left
+    while pos > 0 && chars[pos - 1].is_whitespace() {
+        pos -= 1;
+    }
+    if pos == 0 {
+        return 0;
+    }
+    // Skip word or punctuation chars
+    if chars[pos - 1].is_alphanumeric() || chars[pos - 1] == '_' {
+        while pos > 0 && (chars[pos - 1].is_alphanumeric() || chars[pos - 1] == '_') {
+            pos -= 1;
+        }
+    } else {
+        while pos > 0
+            && !chars[pos - 1].is_alphanumeric()
+            && chars[pos - 1] != '_'
+            && !chars[pos - 1].is_whitespace()
+        {
+            pos -= 1;
+        }
+    }
+    pos
+}
+
+/// Find the char offset of the next word boundary.
+fn word_boundary_right(text: &str, col: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    if col >= len {
+        return len;
+    }
+    let mut pos = col;
+    // Skip current word/punctuation
+    if chars[pos].is_alphanumeric() || chars[pos] == '_' {
+        while pos < len && (chars[pos].is_alphanumeric() || chars[pos] == '_') {
+            pos += 1;
+        }
+    } else if !chars[pos].is_whitespace() {
+        while pos < len
+            && !chars[pos].is_alphanumeric()
+            && chars[pos] != '_'
+            && !chars[pos].is_whitespace()
+        {
+            pos += 1;
+        }
+    }
+    // Skip whitespace
+    while pos < len && chars[pos].is_whitespace() {
+        pos += 1;
+    }
+    pos
 }
 
 #[cfg(test)]
@@ -908,6 +1248,7 @@ mod tests {
             comments: &[],
             comment_edit: None,
             line_select_range: None,
+            char_select_range: None,
         }
     }
 
@@ -1604,20 +1945,41 @@ mod tests {
     }
 
     #[test]
-    fn left_arrow_scrolls_left_in_viewer() {
+    fn left_arrow_moves_cursor_col_left() {
+        let (_tmp, path) = tmp_file("test.txt", b"hello");
         let mut viewer = FileViewer::new();
-        viewer.h_scroll = 8;
+        viewer.load_file(&path);
+        viewer.cursor_col = Some(3);
         viewer.handle_event(key(KeyCode::Left)).unwrap();
-        assert_eq!(viewer.h_scroll, 4);
+        assert_eq!(viewer.cursor_col, Some(2));
     }
 
     #[test]
-    fn right_arrow_scrolls_right_in_viewer() {
-        let (_tmp, path) = tmp_file("wide.txt", b"abcdefghijklmnopqrstuvwxyz");
+    fn left_arrow_clamps_at_zero() {
+        let mut viewer = FileViewer::new();
+        viewer.cursor_col = Some(0);
+        viewer.handle_event(key(KeyCode::Left)).unwrap();
+        assert_eq!(viewer.cursor_col, Some(0));
+    }
+
+    #[test]
+    fn right_arrow_moves_cursor_col_right() {
+        let (_tmp, path) = tmp_file("test.txt", b"hello");
         let mut viewer = FileViewer::new();
         viewer.load_file(&path);
+        viewer.cursor_col = Some(2);
         viewer.handle_event(key(KeyCode::Right)).unwrap();
-        assert_eq!(viewer.h_scroll, H_SCROLL_AMOUNT);
+        assert_eq!(viewer.cursor_col, Some(3));
+    }
+
+    #[test]
+    fn right_arrow_clamps_at_line_length() {
+        let (_tmp, path) = tmp_file("test.txt", b"abc");
+        let mut viewer = FileViewer::new();
+        viewer.load_file(&path);
+        viewer.cursor_col = Some(3); // already at end
+        viewer.handle_event(key(KeyCode::Right)).unwrap();
+        assert_eq!(viewer.cursor_col, Some(3));
     }
 
     // Comment navigation tests
@@ -2126,6 +2488,56 @@ mod tests {
         viewer.cursor_up(&comments);
         assert!(viewer.cursor_on_comment.is_none());
         assert_eq!(viewer.cursor_line, 4);
+    }
+
+    #[test]
+    fn word_boundary_left_basic() {
+        // "hello world" col 11 (end) → 6 (start of "world")
+        assert_eq!(word_boundary_left("hello world", 11), 6);
+        // col 6 → 0 (start of "hello")
+        assert_eq!(word_boundary_left("hello world", 6), 0);
+        // col 0 stays 0
+        assert_eq!(word_boundary_left("hello world", 0), 0);
+    }
+
+    #[test]
+    fn word_boundary_left_underscore_word() {
+        // "foo_bar baz" col 8 → 8 (skips no whitespace, goes back over "baz" to 8)
+        assert_eq!(word_boundary_left("foo_bar baz", 11), 8);
+        // col 7 (space) → 0 (skips space, goes back over "foo_bar")
+        assert_eq!(word_boundary_left("foo_bar baz", 7), 0);
+    }
+
+    #[test]
+    fn word_boundary_left_punctuation() {
+        // "a::b" col 3 → 2 (skips "b" as word), col 2 → 1 (skips "::" as punctuation)
+        assert_eq!(word_boundary_left("a::b", 4), 3);
+        assert_eq!(word_boundary_left("a::b", 3), 1);
+        assert_eq!(word_boundary_left("a::b", 1), 0);
+    }
+
+    #[test]
+    fn word_boundary_right_basic() {
+        // "hello world" col 0 → 6 (skip "hello" then space)
+        assert_eq!(word_boundary_right("hello world", 0), 6);
+        // col 6 → 11 (skip "world")
+        assert_eq!(word_boundary_right("hello world", 6), 11);
+        // col 11 (end) stays 11
+        assert_eq!(word_boundary_right("hello world", 11), 11);
+    }
+
+    #[test]
+    fn word_boundary_right_punctuation() {
+        // "a::b" col 0 → 1 (skip "a"), col 1 → 3 (skip "::"), col 3 → 4 (skip "b")
+        assert_eq!(word_boundary_right("a::b", 0), 1);
+        assert_eq!(word_boundary_right("a::b", 1), 3);
+        assert_eq!(word_boundary_right("a::b", 3), 4);
+    }
+
+    #[test]
+    fn word_boundary_empty_string() {
+        assert_eq!(word_boundary_left("", 0), 0);
+        assert_eq!(word_boundary_right("", 0), 0);
     }
 
 }

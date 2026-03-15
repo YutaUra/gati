@@ -11,7 +11,7 @@ use ratatui::DefaultTerminal;
 
 use crate::watcher::FsWatcher;
 
-use super::comment_ops::{handle_comment_input, handle_line_select};
+use super::comment_ops::{handle_char_select, handle_comment_input, handle_line_select};
 use super::mouse::{handle_mouse, toggle_focus_mode};
 use super::render::draw;
 use crate::components::Component;
@@ -129,6 +129,24 @@ fn restore_terminal() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Enter CharSelect mode if not already in it, using current cursor position as anchor.
+fn ensure_char_select(app: &mut App) {
+    if matches!(app.input_mode, InputMode::CharSelect { .. }) {
+        return;
+    }
+    if let Some(file) = app.file_viewer.current_file() {
+        if let Some(line) = app.file_viewer.cursor_file_line() {
+            let file = file.to_path_buf();
+            let col = app.file_viewer.cursor_col.unwrap_or(0);
+            app.input_mode = InputMode::CharSelect {
+                file,
+                anchor_line: line,
+                anchor_col: col,
+            };
+        }
+    }
+}
+
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
     // Start file-system watcher for live git status updates.
     // Debounce at 500ms so rapid saves don't cause excessive recomputation.
@@ -155,11 +173,21 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<(
                         continue;
                     }
 
-                    // Ctrl+C always quits, regardless of mode
+                    // Ctrl+C: copy in selection modes, quit otherwise
                     if key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
-                        return Ok(());
+                        match &app.input_mode {
+                            InputMode::CharSelect { .. } => {
+                                super::comment_ops::copy_char_selection(app);
+                                continue;
+                            }
+                            InputMode::LineSelect { .. } => {
+                                super::comment_ops::copy_line_selection(app);
+                                continue;
+                            }
+                            _ => return Ok(()),
+                        }
                     }
 
                     // Handle help dialog: consume all keys, close on ? / Esc / q
@@ -179,13 +207,47 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<(
                             handle_comment_input(app, key);
                             continue;
                         }
+                        _ => {}
+                    }
+
+                    // Shift+arrow: start/extend character selection
+                    if key.modifiers.contains(KeyModifiers::SHIFT)
+                        && matches!(key.code, KeyCode::Left | KeyCode::Right)
+                        && app.focus == Focus::Viewer
+                    {
+                        ensure_char_select(app);
+                        if key.modifiers.contains(KeyModifiers::ALT) {
+                            // Shift+Alt: word-level selection
+                            match key.code {
+                                KeyCode::Left => app.file_viewer.cursor_word_left(),
+                                KeyCode::Right => app.file_viewer.cursor_word_right(),
+                                _ => {}
+                            }
+                        } else {
+                            // Shift only: char-level selection
+                            match key.code {
+                                KeyCode::Left => app.file_viewer.cursor_left(),
+                                KeyCode::Right => app.file_viewer.cursor_right(),
+                                _ => {}
+                            }
+                        }
+                        continue;
+                    }
+
+                    match &app.input_mode {
+                        InputMode::CharSelect { .. } => {
+                            if handle_char_select(app, key) {
+                                continue;
+                            }
+                            // If not handled, fall through to normal
+                        }
                         InputMode::LineSelect { .. } => {
                             if handle_line_select(app, key) {
                                 continue;
                             }
                             // If not handled, fall through to normal
                         }
-                        InputMode::Normal => {}
+                        InputMode::Normal | InputMode::CommentInput { .. } => {}
                     }
 
                     // Global keybindings are suppressed while file tree
