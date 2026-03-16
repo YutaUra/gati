@@ -16,7 +16,7 @@ use crate::components::Action;
 use crate::file_tree::FileTree;
 use crate::file_viewer::FileViewer;
 
-use git_worker::{GitStatusWorker, load_file_with_diff, set_diff_for_file};
+use git_worker::{ContentSearchWorker, GitStatusWorker, load_file_with_diff, set_diff_for_file};
 
 /// Default tree pane width as percentage of terminal width.
 pub(super) const DEFAULT_TREE_WIDTH_PERCENT: u16 = 30;
@@ -120,6 +120,8 @@ pub struct App {
     pub show_help: bool,
     /// Temporary flash message shown in the hint bar, auto-dismissed after FLASH_DURATION.
     pub flash_message: Option<FlashMessage>,
+    /// Background worker for content search.
+    pub(super) content_search_worker: Option<ContentSearchWorker>,
 }
 
 impl App {
@@ -173,6 +175,7 @@ impl App {
             tree_inner_y: 0,
             show_help: false,
             flash_message: None,
+            content_search_worker: None,
         })
     }
 
@@ -250,6 +253,27 @@ impl App {
             Action::CursorUp => {
                 let comments = self.viewer_comments();
                 self.file_viewer.cursor_up(&comments);
+            }
+            Action::ContentSearchRequested => {
+                if let Some(ref cs) = self.file_tree.content_search {
+                    if cs.query.len() >= 2 {
+                        self.content_search_worker = Some(ContentSearchWorker::spawn(
+                            self.target_dir.clone(),
+                            cs.query.clone(),
+                            1000,
+                        ));
+                        if let Some(ref mut cs) = self.file_tree.content_search {
+                            cs.searching = true;
+                        }
+                    } else {
+                        self.content_search_worker = None;
+                        if let Some(ref mut cs) = self.file_tree.content_search {
+                            cs.entries.clear();
+                            cs.match_count = 0;
+                            cs.searching = false;
+                        }
+                    }
+                }
             }
             Action::None => {}
         }
@@ -334,9 +358,19 @@ impl App {
             .map(|p| p.to_path_buf())
             .collect();
 
-        let (search_matches, search_current) = match &self.file_viewer.search {
-            Some(s) => (s.matches.clone(), if s.matches.is_empty() { None } else { Some(s.current) }),
-            None => (Vec::new(), None),
+        let (search_matches, search_current) = if let Some(s) = &self.file_viewer.search {
+            // In-viewer search (f / Cmd+F) takes priority
+            (s.matches.clone(), if s.matches.is_empty() { None } else { Some(s.current) })
+        } else if let Some(cs) = &self.file_tree.content_search {
+            // Content search active: highlight query matches in the previewed file
+            if cs.query.len() >= 2 {
+                let matches = self.compute_content_search_highlights(&cs.query);
+                (matches, None) // None = no "current" match cursor
+            } else {
+                (Vec::new(), None)
+            }
+        } else {
+            (Vec::new(), None)
         };
 
         RenderData {
@@ -394,6 +428,32 @@ impl App {
             self.comment_store.relocate_comments(&path, current_lines);
             self.load_diff_for_file(&path);
         }
+    }
+
+    /// Compute search match positions for the current viewer file using the
+    /// content search query. Returns the same format as ViewerSearch.matches:
+    /// (line_idx, start_col, end_col) in char offsets.
+    fn compute_content_search_highlights(&self, query: &str) -> Vec<(usize, usize, usize)> {
+        let total = self.file_viewer.total_lines();
+        if total == 0 || query.is_empty() {
+            return Vec::new();
+        }
+        let query_lower: Vec<char> = query.to_lowercase().chars().collect();
+        let query_len = query_lower.len();
+        let mut matches = Vec::new();
+        for line_idx in 0..total {
+            let line_text = self.file_viewer.line_text(line_idx).unwrap_or("");
+            let line_chars: Vec<char> = line_text.to_lowercase().chars().collect();
+            if line_chars.len() < query_len {
+                continue;
+            }
+            for start in 0..=line_chars.len() - query_len {
+                if line_chars[start..start + query_len] == query_lower[..] {
+                    matches.push((line_idx, start, start + query_len));
+                }
+            }
+        }
+        matches
     }
 
     fn load_diff_for_file(&mut self, path: &std::path::Path) {

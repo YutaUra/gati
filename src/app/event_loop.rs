@@ -301,10 +301,23 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<(
                         continue;
                     }
 
+                    // Cmd+Shift+F / Ctrl+Shift+F: cross-file content search
+                    if key.code == KeyCode::Char('f')
+                        && (key.modifiers.contains(KeyModifiers::SUPER)
+                            || key.modifiers.contains(KeyModifiers::CONTROL))
+                        && key.modifiers.contains(KeyModifiers::SHIFT)
+                    {
+                        app.file_tree.enter_content_search();
+                        app.focus = super::Focus::Tree;
+                        continue;
+                    }
+
                     // Global keybindings are suppressed while file tree
-                    // search is active so that typed characters reach the
-                    // search query instead of triggering shortcuts.
-                    let in_search = app.file_tree.search.is_some();
+                    // search or content search is active so that typed
+                    // characters reach the search query instead of
+                    // triggering shortcuts.
+                    let in_search = app.file_tree.search.is_some()
+                        || app.file_tree.content_search.is_some();
 
                     // '?' toggles help dialog in Normal mode
                     if key.code == KeyCode::Char('?') && !in_search {
@@ -341,6 +354,13 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<(
             && let Some(git_status) = worker.try_recv() {
                 app.file_tree.model.update_git_status(git_status);
                 app.git_worker = None;
+            }
+
+        // Check if background content search has completed
+        if let Some(ref worker) = app.content_search_worker
+            && let Some(results) = worker.try_recv() {
+                app.file_tree.apply_content_search_results(results);
+                app.content_search_worker = None;
             }
 
         // Refresh tree, git status, and diff when the watcher detects file-system changes

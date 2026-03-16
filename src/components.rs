@@ -55,6 +55,8 @@ pub enum Action {
         start_line: usize,
         end_line: usize,
     },
+    /// User updated the content search query — App should spawn a worker.
+    ContentSearchRequested,
 }
 
 /// Trait for TUI components.

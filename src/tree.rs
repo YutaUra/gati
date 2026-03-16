@@ -437,6 +437,101 @@ pub fn search_files(root: &Path, query: &str) -> anyhow::Result<Vec<TreeEntry>> 
     Ok(entries)
 }
 
+/// A single match from searching file contents.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentMatch {
+    pub file: PathBuf,
+    pub line_number: usize, // 1-indexed
+    pub line_text: String,  // trimmed line content
+}
+
+/// Search file contents under `root` for lines matching `query` (case-insensitive substring).
+/// Respects .gitignore, skips binary files (null byte in first 512 bytes) and files > 1MB.
+/// Returns at most `max_matches` results, sorted by file path.
+pub fn search_file_contents(
+    root: &Path,
+    query: &str,
+    max_matches: usize,
+) -> anyhow::Result<Vec<ContentMatch>> {
+    use ignore::WalkBuilder;
+    use std::io::{BufRead, BufReader};
+
+    let query_lower = query.to_lowercase();
+    let mut matches = Vec::new();
+
+    let walker = WalkBuilder::new(root)
+        .hidden(false)
+        .filter_entry(|e| e.file_name() != ".git")
+        .sort_by_file_name(|a, b| {
+            let a_lower = a.to_ascii_lowercase();
+            let b_lower = b.to_ascii_lowercase();
+            a_lower.cmp(&b_lower)
+        })
+        .build();
+
+    for result in walker {
+        if matches.len() >= max_matches {
+            break;
+        }
+
+        let entry = match result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+
+        let path = entry.path();
+
+        // Skip files > 1MB
+        if let Ok(meta) = path.metadata()
+            && meta.len() > 1_048_576
+        {
+            continue;
+        }
+
+        // Read the file; skip binary files (null byte in first 512 bytes)
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let reader = BufReader::new(file);
+        let mut is_first_chunk = true;
+
+        for (line_idx, line_result) in reader.lines().enumerate() {
+            if matches.len() >= max_matches {
+                break;
+            }
+
+            let line = match line_result {
+                Ok(l) => l,
+                Err(_) => break, // likely binary or encoding issue
+            };
+
+            // Binary check on first line content
+            if is_first_chunk {
+                is_first_chunk = false;
+                let check_len = line.len().min(512);
+                if line.as_bytes()[..check_len].contains(&0) {
+                    break;
+                }
+            }
+
+            if line.to_lowercase().contains(&query_lower) {
+                matches.push(ContentMatch {
+                    file: path.to_path_buf(),
+                    line_number: line_idx + 1,
+                    line_text: line.trim().to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(matches)
+}
+
 /// Post-process scanned entries: inject deleted files, sort, annotate git status,
 /// and optionally filter to changed-only. This is the shared pipeline used by
 /// `from_dir`, `toggle_expand`, `refresh_tree`, and `toggle_filter`.
@@ -889,5 +984,86 @@ mod tests {
         let names: Vec<&str> = model.entries.iter().map(|e| e.name()).collect();
         assert!(names.contains(&"file.txt"), "Deleted file should appear in changed filter");
         assert!(!names.contains(&"keep.txt"), "Clean file should not appear in changed filter");
+    }
+
+    #[test]
+    fn search_file_contents_finds_matching_lines() {
+        let tmp = setup_dir_with(
+            &["hello.txt", "world.rs"],
+            &[],
+            |name| match name {
+                "hello.txt" => "line one\nfind me here\nline three".into(),
+                "world.rs" => "fn main() {}\nfind me too".into(),
+                _ => String::new(),
+            },
+        );
+
+        let results = search_file_contents(tmp.path(), "find me", 100).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|m| m.line_text.contains("find me")));
+    }
+
+    #[test]
+    fn search_file_contents_case_insensitive() {
+        let tmp = setup_dir_with(
+            &["test.txt"],
+            &[],
+            |_| "Hello World\nhello world\nHELLO WORLD".into(),
+        );
+
+        let results = search_file_contents(tmp.path(), "hello", 100).unwrap();
+        assert_eq!(results.len(), 3, "Case-insensitive search should match all three lines");
+    }
+
+    #[test]
+    fn search_file_contents_respects_max_matches() {
+        let tmp = setup_dir_with(
+            &["many.txt"],
+            &[],
+            |_| (0..100).map(|i| format!("match line {i}")).collect::<Vec<_>>().join("\n"),
+        );
+
+        let results = search_file_contents(tmp.path(), "match", 5).unwrap();
+        assert_eq!(results.len(), 5, "Should stop at max_matches");
+    }
+
+    #[test]
+    fn search_file_contents_skips_binary_files() {
+        let tmp = setup_dir_with(&["text.txt"], &[], |_| "searchable text".into());
+        // Create a binary file manually
+        fs::write(tmp.path().join("binary.bin"), b"\x00\x01\x02searchable\x03").unwrap();
+
+        let results = search_file_contents(tmp.path(), "searchable", 100).unwrap();
+        assert_eq!(results.len(), 1, "Should only find match in text file, not binary");
+        assert!(results[0].file.ends_with("text.txt"));
+    }
+
+    #[test]
+    fn search_file_contents_returns_correct_line_numbers() {
+        let tmp = setup_dir_with(
+            &["lines.txt"],
+            &[],
+            |_| "alpha\nbeta\ngamma\nbeta again".into(),
+        );
+
+        let results = search_file_contents(tmp.path(), "beta", 100).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].line_number, 2);
+        assert_eq!(results[1].line_number, 4);
+    }
+
+    #[test]
+    fn search_file_contents_trims_line_text() {
+        let tmp = setup_dir_with(
+            &["spaces.txt"],
+            &[],
+            |_| "  leading spaces  \n\ttabbed\t".into(),
+        );
+
+        let results = search_file_contents(tmp.path(), "leading", 100).unwrap();
+        assert_eq!(results[0].line_text, "leading spaces");
+
+        let results = search_file_contents(tmp.path(), "tabbed", 100).unwrap();
+        assert_eq!(results[0].line_text, "tabbed");
     }
 }

@@ -295,7 +295,7 @@ impl FileViewer {
         true
     }
 
-    fn total_lines(&self) -> usize {
+    pub(crate) fn total_lines(&self) -> usize {
         if self.diff.diff_mode {
             return self.diff.total_lines();
         }
@@ -364,7 +364,7 @@ impl FileViewer {
     }
 
     /// Return the text content of a given 0-indexed line.
-    fn line_text(&self, line_idx: usize) -> Option<&str> {
+    pub(crate) fn line_text(&self, line_idx: usize) -> Option<&str> {
         if self.diff.diff_mode {
             self.diff.line_text_at_display(line_idx)
         } else {

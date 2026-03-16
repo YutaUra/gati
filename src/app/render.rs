@@ -127,6 +127,16 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
                     (format!("/{}  Enter/↓ next  ↑ prev  Esc close  ({}/{})",
                         search.query, search.current + 1, search.matches.len()), Color::DarkGray)
                 }
+            } else if let Some(ref cs) = app.file_tree.content_search {
+                if cs.searching {
+                    ("Searching...  Esc cancel".into(), Color::DarkGray)
+                } else if cs.query.len() < 2 {
+                    ("Type 2+ chars  Esc cancel".into(), Color::DarkGray)
+                } else if cs.match_count > 0 {
+                    (format!("{} matches  Enter open  ↑/↓ navigate  Esc cancel", cs.match_count), Color::DarkGray)
+                } else {
+                    ("No matches  Esc cancel".into(), Color::DarkGray)
+                }
             } else if app.file_tree.search.is_some() {
                 ("Enter confirm  Esc cancel  ↑/↓ navigate".into(), Color::DarkGray)
             } else {
@@ -158,6 +168,7 @@ fn draw_help_dialog(buf: &mut ratatui::buffer::Buffer, area: Rect) {
         "   h/l           fold/unfold",
         "   /             search",
         "   g             changed files",
+        "   Ctrl-Shift-F  search in files",
         "   c             comment list",
         "",
         " Viewer",

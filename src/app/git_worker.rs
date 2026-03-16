@@ -4,6 +4,7 @@ use std::sync::mpsc;
 use crate::diff;
 use crate::file_viewer::FileViewer;
 use crate::git_status::GitStatus;
+use crate::tree::ContentMatch;
 
 /// Computes git status on a background thread and sends the result via a channel.
 pub(crate) struct GitStatusWorker {
@@ -24,6 +25,27 @@ impl GitStatusWorker {
 
     /// Non-blocking check for a completed git status result.
     pub(super) fn try_recv(&self) -> Option<Option<GitStatus>> {
+        self.receiver.try_recv().ok()
+    }
+}
+
+/// Searches file contents on a background thread and sends the results via a channel.
+pub(crate) struct ContentSearchWorker {
+    receiver: mpsc::Receiver<Vec<ContentMatch>>,
+}
+
+impl ContentSearchWorker {
+    pub(super) fn spawn(root: PathBuf, query: String, max_matches: usize) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let results =
+                crate::tree::search_file_contents(&root, &query, max_matches).unwrap_or_default();
+            let _ = sender.send(results);
+        });
+        Self { receiver }
+    }
+
+    pub(super) fn try_recv(&self) -> Option<Vec<ContentMatch>> {
         self.receiver.try_recv().ok()
     }
 }

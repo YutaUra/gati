@@ -121,22 +121,29 @@ fn handle_mouse_click(app: &mut App, mouse: crossterm::event::MouseEvent) {
         app.resizing = true;
     } else if mouse.column < border {
         app.focus = Focus::Tree;
-        // Click-to-select tree entry
+        // Click-to-select entry in whichever tree mode is active
         if mouse.row >= app.tree_inner_y {
             let inner_row = (mouse.row - app.tree_inner_y) as usize;
-            let entry_idx = app.file_tree.scroll_offset + inner_row;
-            if let Some(entry) = app.file_tree.model.select_at(entry_idx) {
-                if entry.is_directory {
-                    if let Err(e) = app.file_tree.model.toggle_expand() {
-                        app.flash_message = Some(FlashMessage {
-                            text: format!("Toggle expand failed: {}", e),
-                            color: Color::Red,
-                            created: Instant::now(),
-                        });
+
+            // Content search and comment list modes handle clicks via click_entry
+            if app.file_tree.content_search.is_some() || app.file_tree.is_comment_list_mode() {
+                let action = app.file_tree.click_entry(inner_row);
+                app.handle_action(action);
+            } else {
+                let entry_idx = app.file_tree.scroll_offset + inner_row;
+                if let Some(entry) = app.file_tree.model.select_at(entry_idx) {
+                    if entry.is_directory {
+                        if let Err(e) = app.file_tree.model.toggle_expand() {
+                            app.flash_message = Some(FlashMessage {
+                                text: format!("Toggle expand failed: {}", e),
+                                color: Color::Red,
+                                created: Instant::now(),
+                            });
+                        }
+                    } else {
+                        let path = entry.path.clone();
+                        app.handle_file_action(&path, false);
                     }
-                } else {
-                    let path = entry.path.clone();
-                    app.handle_file_action(&path, false);
                 }
             }
         }
