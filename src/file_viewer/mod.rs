@@ -56,6 +56,10 @@ const COMMENT_RANGE_BG: Color = Color::Indexed(236);
 const DIFF_ADDED_BG: Color = Color::Rgb(0, 40, 0);
 /// Background color for removed lines in diff mode.
 const DIFF_REMOVED_BG: Color = Color::Rgb(40, 0, 0);
+/// Background color for search matches (dark yellow).
+const SEARCH_MATCH_BG: Color = Color::Rgb(100, 80, 0);
+/// Background color for the currently focused search match (bright yellow).
+const SEARCH_CURRENT_BG: Color = Color::Rgb(200, 150, 0);
 /// Character-level selection range, computed in `prepare_for_render()`.
 /// Lines are 1-indexed, columns are 0-indexed character offsets.
 /// `start` is always <= `end` (normalized from anchor + cursor).
@@ -81,6 +85,10 @@ pub struct ViewerRenderContext<'a> {
     pub line_select_range: Option<(usize, usize)>,
     /// Character-level selection range for mouse drag highlighting.
     pub char_select_range: Option<CharSelectRange>,
+    /// Search match positions for highlighting (line_idx, start_col, end_col).
+    pub search_matches: &'a [(usize, usize, usize)],
+    /// Index of the currently focused search match.
+    pub search_current: Option<usize>,
 }
 
 /// Active inline comment editor state, passed from App before each render.
@@ -91,6 +99,90 @@ pub struct CommentEditState {
     pub target_line: usize,
     /// Current text being edited.
     pub text: String,
+}
+
+/// In-viewer text search state (find in file).
+pub struct ViewerSearch {
+    pub query: String,
+    /// All match positions: (line_idx 0-indexed, start_col, end_col) in char offsets.
+    pub matches: Vec<(usize, usize, usize)>,
+    /// Current focused match index.
+    pub current: usize,
+}
+
+impl ViewerSearch {
+    pub fn new() -> Self {
+        Self {
+            query: String::new(),
+            matches: Vec::new(),
+            current: 0,
+        }
+    }
+
+    /// Recompute matches against the given lines (case-insensitive, char-based).
+    pub fn update_matches(&mut self, lines: &[&str]) {
+        self.matches.clear();
+        if self.query.is_empty() {
+            return;
+        }
+        let query_lower: Vec<char> = self.query.to_lowercase().chars().collect();
+        let query_len = query_lower.len();
+        for (line_idx, line) in lines.iter().enumerate() {
+            let line_chars: Vec<char> = line.to_lowercase().chars().collect();
+            if line_chars.len() < query_len {
+                continue;
+            }
+            for start in 0..=line_chars.len() - query_len {
+                if line_chars[start..start + query_len] == query_lower[..] {
+                    self.matches.push((line_idx, start, start + query_len));
+                }
+            }
+        }
+        // Clamp current to valid range
+        if self.matches.is_empty() {
+            self.current = 0;
+        } else if self.current >= self.matches.len() {
+            self.current = self.matches.len() - 1;
+        }
+    }
+
+    /// Move to the next match (wrapping).
+    pub fn next_match(&mut self) {
+        if !self.matches.is_empty() {
+            self.current = (self.current + 1) % self.matches.len();
+        }
+    }
+
+    /// Move to the previous match (wrapping).
+    pub fn prev_match(&mut self) {
+        if !self.matches.is_empty() {
+            self.current = if self.current == 0 {
+                self.matches.len() - 1
+            } else {
+                self.current - 1
+            };
+        }
+    }
+
+    /// Return the current match position, if any.
+    pub fn current_match(&self) -> Option<(usize, usize, usize)> {
+        self.matches.get(self.current).copied()
+    }
+
+    /// Find the nearest match at or after `line_idx` and set `current` to it.
+    /// Used after incremental query updates to jump to the first visible match.
+    pub fn jump_to_nearest(&mut self, line_idx: usize) {
+        if self.matches.is_empty() {
+            return;
+        }
+        // Find the first match at or after line_idx
+        if let Some(pos) = self.matches.iter().position(|(l, _, _)| *l >= line_idx) {
+            self.current = pos;
+        } else {
+            // Wrap to the first match
+            self.current = 0;
+        }
+    }
 }
 
 pub struct FileViewer {
@@ -122,6 +214,8 @@ pub struct FileViewer {
     /// Mapping from visual row offset (relative to content area) to content identity.
     /// Built during render, consumed by click_line.
     row_map: Vec<VisualRowContent>,
+    /// In-viewer text search state (find in file).
+    pub search: Option<ViewerSearch>,
 }
 
 impl FileViewer {
@@ -141,6 +235,7 @@ impl FileViewer {
             cursor_on_comment: None,
             content_rect: None,
             row_map: Vec::new(),
+            search: None,
         }
     }
 
@@ -165,6 +260,7 @@ impl FileViewer {
         self.cursor_col = None;
         self.h_scroll = 0;
         self.cursor_on_comment = None;
+        self.search = None;
         self.diff.clear();
         self.highlight_cache.clear();
 
@@ -664,6 +760,34 @@ impl FileViewer {
                 }
             }
 
+            // Search match highlighting
+            for (m_idx, (m_line, m_start, m_end)) in ctx.search_matches.iter().enumerate() {
+                if *m_line != code_line_idx {
+                    continue;
+                }
+                let gutter_x = content_area.x + gutter_cols as u16;
+                let term_start = if *m_start >= self.h_scroll {
+                    gutter_x + (*m_start - self.h_scroll) as u16
+                } else {
+                    gutter_x
+                };
+                let term_end = if *m_end >= self.h_scroll {
+                    gutter_x + (*m_end - self.h_scroll) as u16
+                } else {
+                    gutter_x
+                };
+                let max_x = content_area.x + content_area.width;
+                let bg = if ctx.search_current == Some(m_idx) {
+                    SEARCH_CURRENT_BG
+                } else {
+                    SEARCH_MATCH_BG
+                };
+                for x in term_start..term_end.min(max_x) {
+                    let cell = &mut buf[(x, y)];
+                    cell.set_bg(bg);
+                }
+            }
+
             // Block cursor: invert fg/bg at the cursor character position
             if is_cursor_line {
                 let col = self.cursor_col.unwrap_or(0);
@@ -912,6 +1036,27 @@ impl FileViewer {
                 }
             }
 
+            // Search match highlighting in diff mode
+            for (m_idx, (m_line, m_start, m_end)) in ctx.search_matches.iter().enumerate() {
+                if *m_line != disp_idx {
+                    continue;
+                }
+                let diff_gutter_cols = 1 + gutter_width + 1;
+                let gutter_x = inner.x + diff_gutter_cols as u16;
+                let term_start = gutter_x + *m_start as u16;
+                let term_end = gutter_x + *m_end as u16;
+                let max_x = inner.x + inner.width;
+                let bg = if ctx.search_current == Some(m_idx) {
+                    SEARCH_CURRENT_BG
+                } else {
+                    SEARCH_MATCH_BG
+                };
+                for x in term_start..term_end.min(max_x) {
+                    let cell = &mut buf[(x, y)];
+                    cell.set_bg(bg);
+                }
+            }
+
             // Block cursor: invert fg/bg at the cursor character position
             if is_cursor_line {
                 let col = self.cursor_col.unwrap_or(0);
@@ -1045,8 +1190,20 @@ impl FileViewer {
         self.cursor_col = Some((col + 1).min(max_col));
     }
 
+    /// Refresh the search matches against the current content.
+    pub fn refresh_search(&mut self) {
+        if let Some(mut search) = self.search.take() {
+            let total = self.total_lines();
+            let lines: Vec<&str> = (0..total)
+                .map(|i| self.line_text(i).unwrap_or(""))
+                .collect();
+            search.update_matches(&lines);
+            self.search = Some(search);
+        }
+    }
+
     /// Ensure the cursor line is visible within the viewport.
-    fn ensure_cursor_visible(&mut self) {
+    pub fn ensure_cursor_visible(&mut self) {
         if self.cursor_line < self.scroll_offset {
             self.scroll_offset = self.cursor_line;
         } else if self.cursor_line >= self.scroll_offset + self.visible_height {
@@ -1153,6 +1310,11 @@ impl Component for FileViewer {
                 self.ensure_cursor_visible();
                 Ok(Action::None)
             }
+            (KeyCode::Char('f'), KeyModifiers::NONE)
+            | (KeyCode::Char('/'), KeyModifiers::NONE) => {
+                self.search = Some(ViewerSearch::new());
+                Ok(Action::None)
+            }
             (KeyCode::Tab, _) => Ok(Action::SwitchFocus),
             (KeyCode::Char('q'), KeyModifiers::NONE) => Ok(Action::Quit),
             _ => Ok(Action::None),
@@ -1249,6 +1411,8 @@ mod tests {
             comment_edit: None,
             line_select_range: None,
             char_select_range: None,
+            search_matches: &[],
+            search_current: None,
         }
     }
 

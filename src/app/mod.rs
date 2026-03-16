@@ -47,6 +47,10 @@ pub(super) struct RenderData {
     pub(super) char_select_range: Option<crate::file_viewer::CharSelectRange>,
     /// Set of files that have at least one comment (for tree markers).
     pub(super) commented_files: std::collections::HashSet<std::path::PathBuf>,
+    /// Search match positions for the viewer (line_idx, start_col, end_col).
+    pub(super) search_matches: Vec<(usize, usize, usize)>,
+    /// Index of the currently focused search match.
+    pub(super) search_current: Option<usize>,
 }
 
 /// Which pane is currently focused.
@@ -330,12 +334,19 @@ impl App {
             .map(|p| p.to_path_buf())
             .collect();
 
+        let (search_matches, search_current) = match &self.file_viewer.search {
+            Some(s) => (s.matches.clone(), if s.matches.is_empty() { None } else { Some(s.current) }),
+            None => (Vec::new(), None),
+        };
+
         RenderData {
             viewer_comments,
             comment_edit,
             line_select_range,
             char_select_range,
             commented_files,
+            search_matches,
+            search_current,
         }
     }
 

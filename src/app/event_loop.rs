@@ -134,17 +134,17 @@ fn ensure_char_select(app: &mut App) {
     if matches!(app.input_mode, InputMode::CharSelect { .. }) {
         return;
     }
-    if let Some(file) = app.file_viewer.current_file() {
-        if let Some(line) = app.file_viewer.cursor_file_line() {
-            let file = file.to_path_buf();
-            let col = app.file_viewer.cursor_col.unwrap_or(0);
-            app.input_mode = InputMode::CharSelect {
-                file,
-                anchor_line: line,
-                anchor_col: col,
-            };
-        }
-    }
+    let Some(file) = app.file_viewer.current_file() else {
+        return;
+    };
+    let Some(line) = app.file_viewer.cursor_file_line() else {
+        return;
+    };
+    app.input_mode = InputMode::CharSelect {
+        file: file.to_path_buf(),
+        anchor_line: line,
+        anchor_col: app.file_viewer.cursor_col.unwrap_or(0),
+    };
 }
 
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
@@ -202,12 +202,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<(
                     }
 
                     // Handle modal input modes first
-                    match &app.input_mode {
-                        InputMode::CommentInput { .. } => {
-                            handle_comment_input(app, key);
-                            continue;
-                        }
-                        _ => {}
+                    if let InputMode::CommentInput { .. } = &app.input_mode {
+                        handle_comment_input(app, key);
+                        continue;
                     }
 
                     // Shift+arrow: start/extend character selection
@@ -248,6 +245,50 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<(
                             // If not handled, fall through to normal
                         }
                         InputMode::Normal | InputMode::CommentInput { .. } => {}
+                    }
+
+                    // Handle viewer search input when active
+                    if app.file_viewer.search.is_some() && app.focus == Focus::Viewer {
+                        match key.code {
+                            KeyCode::Esc => {
+                                app.file_viewer.search = None;
+                            }
+                            KeyCode::Enter | KeyCode::Down => {
+                                if let Some(ref mut s) = app.file_viewer.search {
+                                    s.next_match();
+                                }
+                                jump_to_search_match(app);
+                            }
+                            KeyCode::Up => {
+                                if let Some(ref mut s) = app.file_viewer.search {
+                                    s.prev_match();
+                                }
+                                jump_to_search_match(app);
+                            }
+                            KeyCode::Char(c) => {
+                                if let Some(ref mut s) = app.file_viewer.search {
+                                    s.query.push(c);
+                                }
+                                app.file_viewer.refresh_search();
+                                // Jump to nearest match from current cursor
+                                if let Some(ref mut s) = app.file_viewer.search {
+                                    s.jump_to_nearest(app.file_viewer.cursor_line);
+                                }
+                                jump_to_search_match(app);
+                            }
+                            KeyCode::Backspace => {
+                                if let Some(ref mut s) = app.file_viewer.search {
+                                    s.query.pop();
+                                }
+                                app.file_viewer.refresh_search();
+                                if let Some(ref mut s) = app.file_viewer.search {
+                                    s.jump_to_nearest(app.file_viewer.cursor_line);
+                                }
+                                jump_to_search_match(app);
+                            }
+                            _ => {}
+                        }
+                        continue;
                     }
 
                     // Global keybindings are suppressed while file tree
@@ -297,5 +338,25 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<(
             && watcher.has_changed() {
                 app.refresh_on_fs_change();
             }
+    }
+}
+
+/// Jump the viewer cursor and scroll to the current search match position.
+fn jump_to_search_match(app: &mut App) {
+    let Some(ref search) = app.file_viewer.search else {
+        return;
+    };
+    let Some((line, col, _)) = search.current_match() else {
+        return;
+    };
+    app.file_viewer.cursor_line = line;
+    app.file_viewer.cursor_col = Some(col);
+    app.file_viewer.cursor_on_comment = None;
+    app.file_viewer.ensure_cursor_visible();
+    let content_w = app.file_viewer.visible_content_width;
+    if content_w > 0 && col < app.file_viewer.h_scroll {
+        app.file_viewer.h_scroll = col;
+    } else if content_w > 0 && col >= app.file_viewer.h_scroll + content_w {
+        app.file_viewer.h_scroll = col.saturating_sub(content_w) + 1;
     }
 }

@@ -60,6 +60,8 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         comment_edit: render_data.comment_edit.as_ref(),
         line_select_range: render_data.line_select_range,
         char_select_range: render_data.char_select_range,
+        search_matches: &render_data.search_matches,
+        search_current: render_data.search_current,
     };
 
     // Render panes
@@ -114,6 +116,17 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
                 (flash.text.clone(), flash.color)
             } else if let Some(hints) = super::comment_ops::comment_list_hints(app) {
                 (hints, Color::DarkGray)
+            } else if let Some(ref search) = app.file_viewer.search {
+                if search.matches.is_empty() {
+                    if search.query.is_empty() {
+                        ("/  Enter/↓ next  ↑ prev  Esc close".into(), Color::DarkGray)
+                    } else {
+                        (format!("/{}  (no matches)", search.query), Color::DarkGray)
+                    }
+                } else {
+                    (format!("/{}  Enter/↓ next  ↑ prev  Esc close  ({}/{})",
+                        search.query, search.current + 1, search.matches.len()), Color::DarkGray)
+                }
             } else if app.file_tree.search.is_some() {
                 ("Enter confirm  Esc cancel  ↑/↓ navigate".into(), Color::DarkGray)
             } else {
@@ -148,6 +161,7 @@ fn draw_help_dialog(buf: &mut ratatui::buffer::Buffer, area: Rect) {
         "   c             comment list",
         "",
         " Viewer",
+        "   f /           search in file",
         "   d             toggle diff",
         "   c             add comment",
         "   V             line select",
