@@ -2,8 +2,10 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers,
+            KeyboardEnhancementFlags, PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+               supports_keyboard_enhancement},
     ExecutableCommand,
 };
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
@@ -90,6 +92,13 @@ fn init_terminal() -> anyhow::Result<DefaultTerminal> {
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     io::stdout().execute(EnableMouseCapture)?;
+    // Enable Kitty keyboard protocol to detect Super/Cmd modifier.
+    // Silently ignored by terminals that don't support it.
+    if matches!(supports_keyboard_enhancement(), Ok(true)) {
+        let _ = io::stdout().execute(PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+        ));
+    }
     let terminal = ratatui::init();
     Ok(terminal)
 }
@@ -123,6 +132,7 @@ fn wait_for_terminal_size(
 }
 
 fn restore_terminal() -> anyhow::Result<()> {
+    let _ = io::stdout().execute(PopKeyboardEnhancementFlags);
     io::stdout().execute(DisableMouseCapture)?;
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;

@@ -1311,6 +1311,7 @@ impl Component for FileViewer {
                 Ok(Action::None)
             }
             (KeyCode::Char('f'), KeyModifiers::NONE)
+            | (KeyCode::Char('f'), KeyModifiers::SUPER)
             | (KeyCode::Char('/'), KeyModifiers::NONE) => {
                 self.search = Some(ViewerSearch::new());
                 Ok(Action::None)
