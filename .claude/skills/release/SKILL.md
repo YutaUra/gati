@@ -86,3 +86,38 @@ Watch the release workflow with `gh run watch`. Once it succeeds:
    git commit -m "Update nix/package.nix hashes for vX.Y.Z"
    git push
    ```
+
+## Step 7: Update nixpkgs PR (if open)
+
+Check if there is an open nixpkgs PR for gati:
+
+```
+gh pr list --repo NixOS/nixpkgs --author YutaUra --state open --search "gati"
+```
+
+If found, update the PR to the new version:
+
+1. Fetch and checkout the PR branch in the local nixpkgs clone (`~/work/github.com/yutaura/nixpkgs`):
+   ```
+   DIRENV_LOG_FORMAT="" git -C ~/work/github.com/yutaura/nixpkgs fetch origin <branch> --depth=1
+   DIRENV_LOG_FORMAT="" git -C ~/work/github.com/yutaura/nixpkgs checkout <branch>
+   ```
+   If the branch doesn't exist locally, create it from FETCH_HEAD:
+   ```
+   DIRENV_LOG_FORMAT="" git -C ~/work/github.com/yutaura/nixpkgs checkout -b <branch> FETCH_HEAD
+   ```
+
+2. Update `pkgs/by-name/ga/gati/package.nix` with the new version and hashes
+   (use the same source hash and cargoHash from step 6).
+
+3. Commit and push:
+   ```
+   DIRENV_LOG_FORMAT="" git -C ~/work/github.com/yutaura/nixpkgs add pkgs/by-name/ga/gati/package.nix
+   DIRENV_LOG_FORMAT="" git -C ~/work/github.com/yutaura/nixpkgs commit -m "gati: X.Y.Z -> A.B.C"
+   DIRENV_LOG_FORMAT="" git -C ~/work/github.com/yutaura/nixpkgs push origin <branch>
+   ```
+
+4. Update the PR title if needed:
+   ```
+   gh pr edit <PR_NUMBER> --repo NixOS/nixpkgs --title "gati: init at A.B.C"
+   ```
