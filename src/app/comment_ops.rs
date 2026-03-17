@@ -68,7 +68,7 @@ pub(super) fn export_comments(app: &mut App) {
         });
         return;
     }
-    match cli_clipboard::set_contents(text) {
+    match crate::clipboard::copy(&text) {
         Ok(_) => {
             let count = app.comment_store.len();
             app.flash_message = Some(FlashMessage {
@@ -77,9 +77,9 @@ pub(super) fn export_comments(app: &mut App) {
                 created: Instant::now(),
             });
         }
-        Err(_) => {
+        Err(e) => {
             app.flash_message = Some(FlashMessage {
-                text: "Failed to copy to clipboard".into(),
+                text: format!("Failed to copy to clipboard: {}", e),
                 color: Color::Red,
                 created: Instant::now(),
             });
@@ -363,12 +363,12 @@ pub(super) fn copy_line_selection(app: &mut App) {
     }
 }
 
-/// Copy text to the system clipboard and show a flash message.
+/// Copy text to the clipboard (OS-native or OSC 52 fallback) and show a flash message.
 fn copy_to_clipboard(app: &mut App, text: &str) {
     if text.is_empty() {
         return;
     }
-    match cli_clipboard::set_contents(text.to_string()) {
+    match crate::clipboard::copy(text) {
         Ok(_) => {
             app.flash_message = Some(FlashMessage {
                 text: "Yanked to clipboard".into(),
@@ -376,9 +376,9 @@ fn copy_to_clipboard(app: &mut App, text: &str) {
                 created: Instant::now(),
             });
         }
-        Err(_) => {
+        Err(e) => {
             app.flash_message = Some(FlashMessage {
-                text: "Failed to copy to clipboard".into(),
+                text: format!("Failed to copy to clipboard: {}", e),
                 color: Color::Red,
                 created: Instant::now(),
             });

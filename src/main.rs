@@ -1,5 +1,6 @@
 mod app;
 mod bug_report;
+mod clipboard;
 mod comments;
 mod components;
 mod diff;
