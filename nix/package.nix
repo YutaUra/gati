@@ -10,16 +10,16 @@
 
 rustPlatform.buildRustPackage {
   pname = "gati";
-  version = "0.7.0";
+  version = "0.8.0";
 
   src = fetchFromGitHub {
     owner = "YutaUra";
     repo = "gati";
     rev = "v${version}";
-    hash = "sha256-79PYTtwt5cv+0xRH0kPZLYY7TO9C54JfqsprUESnq4o=";
+    hash = "";
   };
 
-  cargoHash = "sha256-XFIbveWGN38n3lna4ZrMB0z8qtnNLgeJixCYaZcYV68=";
+  cargoHash = "";
 
   nativeBuildInputs = [ pkg-config cmake ];
 

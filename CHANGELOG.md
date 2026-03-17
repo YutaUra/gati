@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-03-17
+
+### Added
+
+- Cross-file text search (`Ctrl+Shift+F` / `Cmd+Shift+F`) with background worker thread for non-blocking search across the entire project
+- In-viewer text search (`f` or `/` in viewer) with incremental case-insensitive matching and match navigation
+- `Cmd+F` / `Ctrl+F` support for in-viewer search via Kitty keyboard protocol
+- Character-level text selection with mouse drag and keyboard (`Shift+←/→`, `Shift+Alt+←/→` for word-level)
+- OSC 52 clipboard fallback for SSH, kubectl exec, and container sessions — export, yank, and copy now work across remote connections
+- Search match highlighting in both the result list and file viewer preview
+
+### Changed
+
+- All clipboard operations (`e` export, `y` yank, `Ctrl+C` copy) now go through a unified `clipboard::copy()` with OS-native → OSC 52 fallback
+- Mouse scroll and click now work correctly in comment list and content search modes (previously ignored)
+
 ## [0.7.0] - 2026-03-13
 
 ### Added
